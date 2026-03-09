@@ -1,0 +1,41 @@
+menu "PEBL Display"
+
+    comment "SPI GPIO pins are configured in CalEPD's 'Display Configuration' menu"
+
+    choice DISPLAY_VARIANT
+        prompt "E-paper display variant"
+        default DISPLAY_GDEW0213I5F
+        help
+            Select the e-paper display model for your hardware.
+            This determines which CalEPD driver class is compiled in.
+            Equivalent to PlatformIO build environments in the Arduino client.
+
+        config DISPLAY_DEPG0213BN
+            bool "2.13\" BW (DEPG0213BN / SSD1680) - LilyGo T5 V2.3.1 default"
+            help
+                DEPG0213BN 2.13" black/white display with SSD1680 controller.
+                Arduino equivalent: env:lilygo_t5_depg_bw
+
+        config DISPLAY_GDEW0213I5F
+            bool "2.13\" 4G (GDEW0213I5F flex) - 4-level grayscale"
+            help
+                GDEW0213I5F 2.13" flexible display with 4-level grayscale support.
+                Arduino equivalent: env:lilygo_t5_gdew_4g
+
+        config DISPLAY_GDEY0213B74
+            bool "2.13\" 4G (GDEY0213B74) - 4-level grayscale, fast refresh"
+            help
+                GDEY0213B74 2.13" display with 4-level grayscale and fast refresh.
+                Arduino equivalent: env:lilygo_t5_gdey_4g
+
+    endchoice
+
+    config DISPLAY_WIDTH
+        int
+        default 212
+
+    config DISPLAY_HEIGHT
+        int
+        default 104
+
+endmenu

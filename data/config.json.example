@@ -1,0 +1,56 @@
+{
+  "device": {
+    "id": "",
+    "name": "My E-Paper Display",
+    "display_variant": "lilygo_t5_gdew_4g"
+  },
+  "wifi": {
+    "timeout_ms": 20000,
+    "force_high_power": false,
+    "escalation_threshold": 3,
+    "max_failed_wakes": 20,
+    "seed_networks": [
+      {"ssid": "Home_WiFi", "password": "your_home_password"},
+      {"ssid": "Office_WiFi", "password": "your_office_password"}
+    ]
+  },
+  "server": {
+    "host": "YOUR_SERVER_URL",
+    "port": 443,
+    "path": "/ws-stream",
+    "use_ssl": true,
+    "reconnect_jitter_max_sec": 0
+  },
+  "display": {
+    "rotation": 1
+  },
+  "security": {
+    "auth_token": "",
+    "encryption": "ecdh"
+  },
+  "power": {
+    "sleep_enabled": true,
+    "sleep_duration_min": 1
+  },
+  "logging": {
+    "default_level": "WARN",
+    "enable_test_commands": false
+  },
+  "timezone": {
+    "sync_interval_hours": 24,
+    "source": "server",
+    "ipgeolocation_api_key": "",
+    "update_server": true
+  },
+  "quiet_hours": {
+    "start_hour": 23,
+    "end_hour": 7,
+    "sleep_multiplier": 6
+  },
+  "display_policy": {
+    "skip_refresh_on_no_message": true
+  },
+  "ota": {
+    "enabled": true
+  }
+}

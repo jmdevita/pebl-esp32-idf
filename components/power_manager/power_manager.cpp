@@ -1,0 +1,256 @@
+/**
+ * Power Manager — ESP-IDF port of Arduino battery monitoring + sleep management.
+ *
+ * Key changes from Arduino:
+ * - FreeRTOS software timer replaces loop()-based polling
+ * - board_acquire/release_wake_lock() prevents light sleep during SPI transactions
+ * - Deep sleep only for: critical battery (<15%), extended WiFi loss
+ * - Normal idle state: auto light sleep with WiFi DTIM maintained (~1-3mA)
+ */
+
+#include "power_manager.h"
+#include "board.h"
+#include "config_manager.h"
+#include "wifi_manager.h"
+
+#include "esp_log.h"
+#include "esp_sleep.h"
+#include "esp_timer.h"
+#include "esp_pm.h"
+#include "esp_wifi.h"
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static const char *TAG = "POWER";
+
+/* Track the last power source to detect transitions and reconfigure
+ * CPU frequency only when the source actually changes. */
+static power_source_t s_last_freq_source = POWER_SOURCE_UNKNOWN;
+
+static power_source_t s_source = POWER_SOURCE_UNKNOWN;
+static int s_battery_mv = 0;
+
+/**
+ * Map battery voltage to percentage using LiPo discharge curve.
+ * Same mapping as Arduino version for consistent UX.
+ */
+static uint8_t voltage_to_percent(int mv)
+{
+    if (mv >= BATTERY_LIPO_MAX_MV) return 100;
+    if (mv >= 4100) return 90;
+    if (mv >= 4000) return 80;
+    if (mv >= 3900) return 70;
+    if (mv >= 3800) return 60;
+    if (mv >= 3700) return 50;
+    if (mv >= 3600) return 40;
+    if (mv >= BATTERY_LOW_MV) return 30;
+    if (mv >= 3400) return 20;
+    if (mv >= BATTERY_CRITICAL_MV) return 15;
+    if (mv >= 3200) return 10;
+    if (mv >= 3100) return 5;
+    return 0;
+}
+
+
+esp_err_t power_manager_init(void)
+{
+    /* Wake lock is now managed by the board component (board_acquire/release_wake_lock)
+     * to avoid circular dependency between power_manager and display_manager. */
+
+    /* Initial battery reading */
+    int raw_mv = board_adc_read_battery_mv();
+    s_battery_mv = raw_mv * BATTERY_VOLTAGE_DIVIDER_RATIO;
+
+    /* Determine initial power source */
+    if (s_battery_mv > BATTERY_USB_THRESHOLD) {
+        s_source = POWER_SOURCE_USB;
+    } else if (s_battery_mv > BATTERY_NO_BATTERY_MIN && s_battery_mv < BATTERY_NO_BATTERY_MAX) {
+        s_source = POWER_SOURCE_BATTERY;
+    } else {
+        s_source = POWER_SOURCE_UNKNOWN;
+    }
+
+    ESP_LOGI(TAG, "Power init: %d mV, %d%%, source=%s",
+             s_battery_mv, voltage_to_percent(s_battery_mv),
+             s_source == POWER_SOURCE_USB ? "USB" :
+             s_source == POWER_SOURCE_BATTERY ? "battery" : "unknown");
+
+    return ESP_OK;
+}
+
+void power_manager_check(EventGroupHandle_t system_events)
+{
+    /* Read battery voltage */
+    int raw_mv = board_adc_read_battery_mv();
+    if (raw_mv < 0) {
+        return;
+    }
+    s_battery_mv = raw_mv * BATTERY_VOLTAGE_DIVIDER_RATIO;
+
+    /* Update power source with hysteresis */
+    if (s_source == POWER_SOURCE_BATTERY && s_battery_mv > BATTERY_USB_HYSTERESIS) {
+        s_source = POWER_SOURCE_USB;
+        ESP_LOGI(TAG, "Power source: USB detected (%d mV)", s_battery_mv);
+    } else if (s_source == POWER_SOURCE_USB && s_battery_mv < BATTERY_USB_THRESHOLD) {
+        s_source = POWER_SOURCE_BATTERY;
+        ESP_LOGI(TAG, "Power source: battery (%d mV, %d%%)",
+                 s_battery_mv, voltage_to_percent(s_battery_mv));
+    }
+
+    /* CPU frequency scaling on power source transition.
+     * Battery: cap at 160MHz (~30% power savings during active processing).
+     * USB: full 240MHz for responsive operation.
+     * With IDF's auto light sleep the CPU sleeps most of the time, but this
+     * still saves power during the 2-4s active e-paper refresh cycles. */
+    if (s_source != s_last_freq_source) {
+        esp_pm_config_t pm_cfg = {
+            .max_freq_mhz = (s_source == POWER_SOURCE_BATTERY) ? 160 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+            .min_freq_mhz = 80,
+            .light_sleep_enable = true
+        };
+        esp_err_t pm_ret = esp_pm_configure(&pm_cfg);
+        if (pm_ret == ESP_OK) {
+            ESP_LOGI(TAG, "CPU freq cap set to %d MHz (%s)",
+                     pm_cfg.max_freq_mhz,
+                     s_source == POWER_SOURCE_BATTERY ? "battery" : "USB");
+        }
+        s_last_freq_source = s_source;
+    }
+
+    /* Critical battery detection moved to power_task (app_main.cpp) so it can
+     * show the "LOW BATTERY / PLEASE CHARGE" screen before entering deep sleep.
+     * power_manager_check() no longer sleeps directly — the caller is responsible
+     * for checking power_manager_is_critical_battery() and acting on it. */
+
+    ESP_LOGD(TAG, "Battery: %d mV (%d%%), source: %s",
+             s_battery_mv, voltage_to_percent(s_battery_mv),
+             s_source == POWER_SOURCE_USB ? "USB" : "battery");
+}
+
+bool power_manager_is_critical_battery(void)
+{
+    return s_source == POWER_SOURCE_BATTERY && s_battery_mv < BATTERY_CRITICAL_MV;
+}
+
+/**
+ * Handle physical button press with tiered hold duration actions.
+ * Same tiered behavior as the Arduino version:
+ *
+ *   < 3 seconds:  Short press — show status (battery, connection)
+ *   3-9 seconds:  Enter pairing mode for multi-platform linking
+ *   15+ seconds:  Enter WiFi provisioning portal (factory reset WiFi)
+ *
+ * Returns a button_result_t indicating what action the caller should take.
+ * The caller (button_task in app_main) handles display rendering and
+ * system events, avoiding a circular dependency between power_manager
+ * and display_manager.
+ */
+button_result_t power_manager_handle_button(void)
+{
+    button_result_t result = {
+        .action = BUTTON_ACTION_NONE,
+        .battery_percent = power_manager_get_battery_percent(),
+        .battery_mv = s_battery_mv,
+        .source = s_source,
+        .has_auth_token = false,
+    };
+
+    board_pins_t pins;
+    board_get_pin_config(&pins);
+
+    int64_t press_start_us = esp_timer_get_time();
+
+    /* Measure hold duration (up to 17s max) by polling GPIO level.
+     * Button is active LOW — held = gpio reads 0. */
+    while (gpio_get_level((gpio_num_t)pins.button_gpio) == 0) {
+        int64_t held_ms = (esp_timer_get_time() - press_start_us) / 1000;
+        if (held_ms > 17000) {
+            break;  /* Safety limit */
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    int64_t press_duration_ms = (esp_timer_get_time() - press_start_us) / 1000;
+    ESP_LOGI(TAG, "Button held for %lld ms", press_duration_ms);
+
+    if (press_duration_ms >= 15000) {
+        /* 15+ seconds: WiFi provisioning portal (factory reset WiFi) */
+        ESP_LOGI(TAG, "Extra-long press — WiFi provisioning requested");
+        result.action = BUTTON_ACTION_WIFI_PORTAL;
+
+    } else if (press_duration_ms >= 3000) {
+        /* 3-9 seconds: Enter pairing mode for multi-platform linking */
+        const app_config_t *cfg = config_manager_get_config();
+        result.has_auth_token = (cfg->security.auth_token[0] != '\0');
+
+        if (result.has_auth_token) {
+            ESP_LOGI(TAG, "Medium press — pairing mode requested");
+            result.action = BUTTON_ACTION_ENTER_PAIRING;
+        } else {
+            ESP_LOGW(TAG, "Medium press but no auth token — cannot pair");
+            result.action = BUTTON_ACTION_SHOW_STATUS;
+        }
+
+    } else {
+        /* Short press: show status */
+        ESP_LOGI(TAG, "Short press — show status");
+        result.action = BUTTON_ACTION_SHOW_STATUS;
+    }
+
+    return result;
+}
+
+int power_manager_get_battery_mv(void)
+{
+    return s_battery_mv;
+}
+
+uint8_t power_manager_get_battery_percent(void)
+{
+    return voltage_to_percent(s_battery_mv);
+}
+
+power_source_t power_manager_get_source(void)
+{
+    return s_source;
+}
+
+void power_manager_deep_sleep(uint64_t duration_us)
+{
+    /* WiFi fallback mode override: use 60-minute intervals so the device
+     * periodically retries WiFi rather than sleeping for potentially longer
+     * quiet-hours or resilience-triggered durations. */
+    if (wifi_manager_is_fallback_mode()) {
+        const uint64_t fallback_us = 60ULL * 60 * 1000000;  /* 60 minutes */
+        if (duration_us > fallback_us) {
+            ESP_LOGI(TAG, "WiFi fallback — capping sleep to 60 min (was %llu min)",
+                     duration_us / 60000000ULL);
+            duration_us = fallback_us;
+        }
+    }
+
+    /* Clean up WiFi before deep sleep to avoid stale AP associations.
+     * WebSocket cleanup is handled by the caller (graceful_shutdown in
+     * app_main.cpp) for most paths. This ensures WiFi is always stopped
+     * even for paths that call deep_sleep directly (quiet hours, critical battery). */
+    wifi_manager_disconnect();
+
+    board_pins_t pins;
+    board_get_pin_config(&pins);
+    board_configure_wake_sources(pins.button_gpio, duration_us);
+
+    ESP_LOGI(TAG, "Entering deep sleep for %llu ms", duration_us / 1000);
+    esp_deep_sleep_start();
+    /* Does not return */
+}
+
+esp_err_t power_manager_acquire_wake_lock(void)
+{
+    return board_acquire_wake_lock();
+}
+
+esp_err_t power_manager_release_wake_lock(void)
+{
+    return board_release_wake_lock();
+}

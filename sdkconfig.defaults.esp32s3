@@ -1,0 +1,9 @@
+# Custom PCB (ESP32-S3) target-specific settings
+CONFIG_IDF_TARGET="esp32s3"
+
+# Pin assignments (TBD per final PCB design)
+CONFIG_BOARD_BUTTON_GPIO=0
+CONFIG_BOARD_ADC_BATTERY_CHANNEL=0
+
+# ESP32-S3 does not support ext0 wake — use ext1 (bitmask-based)
+CONFIG_BOARD_WAKE_USE_EXT0=n

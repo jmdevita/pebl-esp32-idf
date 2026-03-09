@@ -1,0 +1,6 @@
+## IDF Component Manager manifest
+## Managed components that are not part of the default ESP-IDF distribution
+dependencies:
+  espressif/esp_websocket_client: "^1.0.0"
+  joltwallet/littlefs: "^1.14.0"
+  espressif/qrcode: ">=0.1.0"

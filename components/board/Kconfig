@@ -1,0 +1,28 @@
+menu "Board Configuration"
+
+    config BOARD_BUTTON_GPIO
+        int "Button GPIO number"
+        default 39 if IDF_TARGET_ESP32
+        default 0 if IDF_TARGET_ESP32S3
+        help
+            GPIO pin connected to the physical button.
+            LilyGo T5: GPIO 39 (built-in button).
+            Custom S3 PCB: TBD per schematic.
+
+    config BOARD_ADC_BATTERY_CHANNEL
+        int "Battery ADC channel"
+        default 0
+        help
+            ADC1 channel number for battery voltage divider.
+            LilyGo T5: Channel 0 (GPIO 36).
+            Custom S3 PCB: TBD per schematic.
+
+    config BOARD_WAKE_USE_EXT0
+        bool "Use ext0 wake source (ESP32 only)"
+        default y if IDF_TARGET_ESP32
+        default n if IDF_TARGET_ESP32S3
+        help
+            ESP32 supports ext0 (single GPIO, level-triggered) wake from deep sleep.
+            ESP32-S3 does not have ext0 — use ext1 (bitmask, multiple GPIOs) instead.
+
+endmenu

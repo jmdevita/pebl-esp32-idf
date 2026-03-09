@@ -1,0 +1,24 @@
+# LilyGo T5 (ESP32) target-specific settings
+CONFIG_IDF_TARGET="esp32"
+
+# LilyGo T5 pin assignments
+CONFIG_BOARD_BUTTON_GPIO=39
+CONFIG_BOARD_ADC_BATTERY_CHANNEL=0
+
+# ESP32 supports ext0 wake (single GPIO, level-triggered)
+CONFIG_BOARD_WAKE_USE_EXT0=y
+
+# ESP32 ADC calibration uses line fitting (eFuse Vref)
+CONFIG_ADC_CAL_EFUSE_VREF_ENABLE=y
+CONFIG_ADC_CAL_EFUSE_TP_ENABLE=y
+
+# LilyGo T5 e-paper SPI pins (matches Arduino client pin assignments)
+CONFIG_EINK_SPI_MOSI=23
+CONFIG_EINK_SPI_CLK=18
+CONFIG_EINK_SPI_CS=5
+CONFIG_EINK_DC=17
+CONFIG_EINK_RST=16
+CONFIG_EINK_BUSY=4
+
+# LilyGo T5 default display: GDEW0213I5F (2.13" 4-level grayscale, flexible)
+CONFIG_DISPLAY_GDEW0213I5F=y

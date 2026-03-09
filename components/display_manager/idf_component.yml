@@ -1,0 +1,5 @@
+## Display Manager component dependencies
+## CalEPD and Adafruit-GFX-Library are local components (cloned via setup_display_deps.sh).
+## QRCode is available from the ESP Component Registry.
+dependencies:
+  espressif/qrcode: ">=0.1.0"
