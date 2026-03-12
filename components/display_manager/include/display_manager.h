@@ -24,6 +24,7 @@ typedef enum {
     DISPLAY_EVT_WIFI_PROVISION, /* WiFi QR code + setup instructions */
     DISPLAY_EVT_LOW_BATTERY,    /* "LOW BATTERY" / "PLEASE CHARGE" */
     DISPLAY_EVT_PURCHASE_QR,    /* "Trial Expired" + purchase QR code */
+    DISPLAY_EVT_BROADCAST,     /* Broadcast alert (text-only, full width) */
     DISPLAY_EVT_DIAGNOSTICS,   /* Network diagnostics results */
 } display_event_type_t;
 
@@ -87,6 +88,12 @@ typedef struct {
             char url[128];       /* Purchase URL for QR code */
             char device_id[32];  /* Device ID (truncated to 8 chars on display) */
         } purchase;
+        struct {
+            char source[64];    /* sender / alert source label */
+            char message[256];  /* broadcast text */
+            char platform[16];  /* "slack", "api", etc. */
+            bool encrypted;     /* show lock icon if true */
+        } broadcast;
         struct {
             diag_result_t result;
         } diagnostics;

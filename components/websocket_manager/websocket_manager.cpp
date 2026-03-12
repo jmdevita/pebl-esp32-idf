@@ -270,6 +270,48 @@ static void handle_reaction_message(const cJSON *source, bool was_encrypted)
     atomic_store(&s_last_reaction_us, esp_timer_get_time());
 }
 
+/**
+ * Process a broadcast alert message and dispatch to display queue.
+ * Broadcasts are text-only (no emoji download). Layout uses full display width.
+ *
+ * JSON: {"type":"broadcast","message_id":"...","user":"Ops","message":"Alert text",
+ *        "platform":"slack","encrypted":false}
+ */
+static void handle_broadcast_message(const cJSON *source, bool was_encrypted)
+{
+    if (!s_display_queue) {
+        return;
+    }
+
+    const cJSON *message_id = cJSON_GetObjectItemCaseSensitive(source, "message_id");
+
+    display_event_t evt = {};
+    evt.type = DISPLAY_EVT_BROADCAST;
+    evt.data.broadcast.encrypted = was_encrypted;
+
+    copy_json_string(evt.data.broadcast.source, sizeof(evt.data.broadcast.source),
+                     source, "user");
+    copy_json_string(evt.data.broadcast.message, sizeof(evt.data.broadcast.message),
+                     source, "message");
+    copy_json_string(evt.data.broadcast.platform, sizeof(evt.data.broadcast.platform),
+                     source, "platform");
+
+    ESP_LOGI(TAG, "Broadcast from %s: %.60s%s",
+             evt.data.broadcast.source, evt.data.broadcast.message,
+             evt.data.broadcast.encrypted ? " [encrypted]" : "");
+
+    if (xQueueSend(s_display_queue, &evt, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Display queue full, dropping broadcast");
+    }
+
+    if (cJSON_IsString(message_id)) {
+        send_ack(message_id->valuestring);
+    }
+
+    resilience_manager_mark_message_delivered();
+    atomic_store(&s_last_reaction_us, esp_timer_get_time());
+}
+
 /* Firmware update flags — set by WS event handler, consumed by ws_task.
  * Required updates install immediately; optional updates wait for 5 min idle. */
 static atomic_bool s_pending_firmware_required = false;
@@ -518,6 +560,8 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                             handle_reaction_message(dispatch_root, decrypted_root != NULL);
                         } else if (strcmp(type->valuestring, "firmware_update") == 0) {
                             handle_firmware_message(dispatch_root);
+                        } else if (strcmp(type->valuestring, "broadcast") == 0) {
+                            handle_broadcast_message(dispatch_root, decrypted_root != NULL);
                         } else if (strcmp(type->valuestring, "error") == 0) {
                             handle_error_message(dispatch_root);
                         }

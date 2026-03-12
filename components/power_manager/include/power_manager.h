@@ -15,6 +15,7 @@ extern "C" {
  * Same thresholds as the Arduino version for consistent behavior.
  */
 #define BATTERY_CRITICAL_MV     3300    /* <15% — trigger deep sleep */
+#define BATTERY_RECOVERY_MV     3400    /* ~20% — must reach this to exit critical state (hysteresis) */
 #define BATTERY_LOW_MV          3500    /* <30% — warning */
 #define BATTERY_USB_THRESHOLD   4050    /* Detect USB power (charging) */
 #define BATTERY_USB_HYSTERESIS  4150    /* Hysteresis for USB→battery transition */

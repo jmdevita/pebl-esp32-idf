@@ -58,22 +58,39 @@ static const char *TAG = "APP_MAIN";
 
 /**
  * RTC memory persists across deep sleep (not across power-on reset).
- * Stores last reaction data and display state so that on deep sleep wake:
+ * Stores last display content and state flags so that on deep sleep wake:
  * - The device can skip display refresh if content hasn't changed
  *   (skip_refresh_on_no_message policy)
- * - Future: restore last reaction without needing WebSocket reconnect
+ * - Restores last content (reaction or broadcast) without needing WebSocket reconnect
  */
+enum display_content_type_t : uint8_t {
+    DISPLAY_CONTENT_NONE = 0,
+    DISPLAY_CONTENT_REACTION = 1,
+    DISPLAY_CONTENT_BROADCAST = 2,
+};
+
 RTC_DATA_ATTR static struct {
-    bool has_reaction;
-    char emoji[32];
-    char emoji_url[128];
-    char user[64];
-    char channel[128];
-    char message[256];
-    char platform[32];
-    bool is_encrypted;
+    display_content_type_t content_type;
+    union {
+        struct {
+            char emoji[32];
+            char emoji_url[128];
+            char user[64];
+            char channel[128];
+            char message[256];
+            char platform[16];  // Matches reaction_data_t.platform size
+            bool is_encrypted;
+        } reaction;
+        struct {
+            char source[64];
+            char message[256];
+            char platform[16];
+            bool encrypted;
+        } broadcast;
+    };
     bool showing_connection_lost;
     bool has_shown_blank_screen;
+    bool was_critical_battery;    // Previously entered critical sleep — require recovery threshold to exit
 } s_rtc_state = {};
 
 /* FreeRTOS task handles */
@@ -588,6 +605,50 @@ static uint8_t *download_emoji_for_restore(const char *url, size_t *out_size)
 }
 
 /**
+ * Restore last displayed content from RTC memory.
+ * For reactions, re-downloads emoji via cached URL. For broadcasts, constructs
+ * a display event directly (no image needed). Returns true if restored.
+ */
+static bool restore_last_display(void)
+{
+    switch (s_rtc_state.content_type) {
+    case DISPLAY_CONTENT_REACTION: {
+        ESP_LOGI(TAG, "Restoring last reaction from RTC");
+        display_event_t restore_evt = {};
+        restore_evt.type = DISPLAY_EVT_REACTION;
+        restore_evt.data.reaction.is_encrypted = s_rtc_state.reaction.is_encrypted;
+        strncpy(restore_evt.data.reaction.user, s_rtc_state.reaction.user, sizeof(restore_evt.data.reaction.user) - 1);
+        strncpy(restore_evt.data.reaction.channel, s_rtc_state.reaction.channel, sizeof(restore_evt.data.reaction.channel) - 1);
+        strncpy(restore_evt.data.reaction.message_preview, s_rtc_state.reaction.message, sizeof(restore_evt.data.reaction.message_preview) - 1);
+        strncpy(restore_evt.data.reaction.emoji_name, s_rtc_state.reaction.emoji, sizeof(restore_evt.data.reaction.emoji_name) - 1);
+        strncpy(restore_evt.data.reaction.platform, s_rtc_state.reaction.platform, sizeof(restore_evt.data.reaction.platform) - 1);
+
+        size_t png_size = 0;
+        uint8_t *png_data = download_emoji_for_restore(s_rtc_state.reaction.emoji_url, &png_size);
+        restore_evt.data.reaction.emoji_png_data = png_data;
+        restore_evt.data.reaction.emoji_png_size = png_size;
+
+        display_manager_render(&restore_evt);
+        return true;
+    }
+    case DISPLAY_CONTENT_BROADCAST: {
+        ESP_LOGI(TAG, "Restoring last broadcast from RTC");
+        display_event_t restore_evt = {};
+        restore_evt.type = DISPLAY_EVT_BROADCAST;
+        strncpy(restore_evt.data.broadcast.source, s_rtc_state.broadcast.source, sizeof(restore_evt.data.broadcast.source) - 1);
+        strncpy(restore_evt.data.broadcast.message, s_rtc_state.broadcast.message, sizeof(restore_evt.data.broadcast.message) - 1);
+        strncpy(restore_evt.data.broadcast.platform, s_rtc_state.broadcast.platform, sizeof(restore_evt.data.broadcast.platform) - 1);
+        restore_evt.data.broadcast.encrypted = s_rtc_state.broadcast.encrypted;
+
+        display_manager_render(&restore_evt);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+/**
  * Display task: renders reactions on e-paper display.
  * Blocks on xQueueReceive with finite timeout — allows checking shutdown flag.
  * Takes 2-4s per refresh but does not block WebSocket reception
@@ -612,29 +673,12 @@ static void display_task(void *arg)
              * Case 3: Normal reconnect with valid content already on screen
              *         → Skip refresh entirely (preserve current display) */
             if (evt.type == DISPLAY_EVT_CONNECTED) {
-                if (s_rtc_state.showing_connection_lost && s_rtc_state.has_reaction) {
-                    /* "Connection Lost" screen replaced the reaction — restore it.
-                     * Re-download the emoji PNG from the cached URL (matches Arduino
-                     * behavior). Falls back to text-only if download fails. */
-                    ESP_LOGI(TAG, "Reconnected — restoring last reaction");
-                    display_event_t restore_evt = {};
-                    restore_evt.type = DISPLAY_EVT_REACTION;
-                    restore_evt.data.reaction.is_encrypted = s_rtc_state.is_encrypted;
-                    strncpy(restore_evt.data.reaction.user, s_rtc_state.user, sizeof(restore_evt.data.reaction.user) - 1);
-                    strncpy(restore_evt.data.reaction.channel, s_rtc_state.channel, sizeof(restore_evt.data.reaction.channel) - 1);
-                    strncpy(restore_evt.data.reaction.message_preview, s_rtc_state.message, sizeof(restore_evt.data.reaction.message_preview) - 1);
-                    strncpy(restore_evt.data.reaction.emoji_name, s_rtc_state.emoji, sizeof(restore_evt.data.reaction.emoji_name) - 1);
-                    strncpy(restore_evt.data.reaction.platform, s_rtc_state.platform, sizeof(restore_evt.data.reaction.platform) - 1);
-
-                    /* Re-download emoji from cached URL. Gracefully degrades to
-                     * text-only if the URL expired or download fails. */
-                    size_t png_size = 0;
-                    uint8_t *png_data = download_emoji_for_restore(s_rtc_state.emoji_url, &png_size);
-                    restore_evt.data.reaction.emoji_png_data = png_data;
-                    restore_evt.data.reaction.emoji_png_size = png_size;
-
-                    display_manager_render(&restore_evt);
-                    /* display_manager_render frees emoji_png_data after rendering */
+                if (s_rtc_state.showing_connection_lost && s_rtc_state.content_type != DISPLAY_CONTENT_NONE) {
+                    /* "Connection Lost" screen replaced the last content — restore it.
+                     * For reactions, re-downloads emoji PNG from cached URL.
+                     * For broadcasts, constructs display event directly (no image needed). */
+                    ESP_LOGI(TAG, "Reconnected — restoring last display content");
+                    restore_last_display();
                     s_rtc_state.showing_connection_lost = false;
                     continue;
                 } else if (s_rtc_state.showing_connection_lost || !s_rtc_state.has_shown_blank_screen) {
@@ -659,24 +703,34 @@ static void display_task(void *arg)
 
             display_manager_render(&evt);
 
-            /* Persist reaction data to RTC memory for deep sleep recovery.
+            /* Persist display content to RTC memory for deep sleep recovery.
              * On next deep sleep wake, skip_refresh_on_no_message can avoid
-             * a full display refresh if the same reaction is still showing. */
+             * a full display refresh if the same content is still showing. */
             if (evt.type == DISPLAY_EVT_REACTION) {
-                s_rtc_state.has_reaction = true;
-                strncpy(s_rtc_state.emoji, evt.data.reaction.emoji_name, sizeof(s_rtc_state.emoji) - 1);
-                s_rtc_state.emoji[sizeof(s_rtc_state.emoji) - 1] = '\0';
-                strncpy(s_rtc_state.emoji_url, evt.data.reaction.emoji_url, sizeof(s_rtc_state.emoji_url) - 1);
-                s_rtc_state.emoji_url[sizeof(s_rtc_state.emoji_url) - 1] = '\0';
-                strncpy(s_rtc_state.user, evt.data.reaction.user, sizeof(s_rtc_state.user) - 1);
-                s_rtc_state.user[sizeof(s_rtc_state.user) - 1] = '\0';
-                strncpy(s_rtc_state.channel, evt.data.reaction.channel, sizeof(s_rtc_state.channel) - 1);
-                s_rtc_state.channel[sizeof(s_rtc_state.channel) - 1] = '\0';
-                strncpy(s_rtc_state.message, evt.data.reaction.message_preview, sizeof(s_rtc_state.message) - 1);
-                s_rtc_state.message[sizeof(s_rtc_state.message) - 1] = '\0';
-                strncpy(s_rtc_state.platform, evt.data.reaction.platform, sizeof(s_rtc_state.platform) - 1);
-                s_rtc_state.platform[sizeof(s_rtc_state.platform) - 1] = '\0';
-                s_rtc_state.is_encrypted = evt.data.reaction.is_encrypted;
+                s_rtc_state.content_type = DISPLAY_CONTENT_REACTION;
+                strncpy(s_rtc_state.reaction.emoji, evt.data.reaction.emoji_name, sizeof(s_rtc_state.reaction.emoji) - 1);
+                s_rtc_state.reaction.emoji[sizeof(s_rtc_state.reaction.emoji) - 1] = '\0';
+                strncpy(s_rtc_state.reaction.emoji_url, evt.data.reaction.emoji_url, sizeof(s_rtc_state.reaction.emoji_url) - 1);
+                s_rtc_state.reaction.emoji_url[sizeof(s_rtc_state.reaction.emoji_url) - 1] = '\0';
+                strncpy(s_rtc_state.reaction.user, evt.data.reaction.user, sizeof(s_rtc_state.reaction.user) - 1);
+                s_rtc_state.reaction.user[sizeof(s_rtc_state.reaction.user) - 1] = '\0';
+                strncpy(s_rtc_state.reaction.channel, evt.data.reaction.channel, sizeof(s_rtc_state.reaction.channel) - 1);
+                s_rtc_state.reaction.channel[sizeof(s_rtc_state.reaction.channel) - 1] = '\0';
+                strncpy(s_rtc_state.reaction.message, evt.data.reaction.message_preview, sizeof(s_rtc_state.reaction.message) - 1);
+                s_rtc_state.reaction.message[sizeof(s_rtc_state.reaction.message) - 1] = '\0';
+                strncpy(s_rtc_state.reaction.platform, evt.data.reaction.platform, sizeof(s_rtc_state.reaction.platform) - 1);
+                s_rtc_state.reaction.platform[sizeof(s_rtc_state.reaction.platform) - 1] = '\0';
+                s_rtc_state.reaction.is_encrypted = evt.data.reaction.is_encrypted;
+                s_rtc_state.showing_connection_lost = false;
+            } else if (evt.type == DISPLAY_EVT_BROADCAST) {
+                s_rtc_state.content_type = DISPLAY_CONTENT_BROADCAST;
+                strncpy(s_rtc_state.broadcast.source, evt.data.broadcast.source, sizeof(s_rtc_state.broadcast.source) - 1);
+                s_rtc_state.broadcast.source[sizeof(s_rtc_state.broadcast.source) - 1] = '\0';
+                strncpy(s_rtc_state.broadcast.message, evt.data.broadcast.message, sizeof(s_rtc_state.broadcast.message) - 1);
+                s_rtc_state.broadcast.message[sizeof(s_rtc_state.broadcast.message) - 1] = '\0';
+                strncpy(s_rtc_state.broadcast.platform, evt.data.broadcast.platform, sizeof(s_rtc_state.broadcast.platform) - 1);
+                s_rtc_state.broadcast.platform[sizeof(s_rtc_state.broadcast.platform) - 1] = '\0';
+                s_rtc_state.broadcast.encrypted = evt.data.broadcast.encrypted;
                 s_rtc_state.showing_connection_lost = false;
             } else if (evt.type == DISPLAY_EVT_DISCONNECTED) {
                 s_rtc_state.showing_connection_lost = true;
@@ -713,6 +767,7 @@ static void power_task(void *arg)
         if (power_manager_is_critical_battery()) {
             ESP_LOGW(TAG, "Critical battery (%d mV) — showing warning before indefinite deep sleep",
                      power_manager_get_battery_mv());
+            s_rtc_state.was_critical_battery = true;
             display_event_t evt = {};
             evt.type = DISPLAY_EVT_LOW_BATTERY;
             xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
@@ -1063,7 +1118,7 @@ extern "C" void app_main(void)
          * and no power state changed, skip the refresh entirely. E-paper retains
          * its image without power, so the content is still visible. */
         if (skip_cfg->display_policy.skip_refresh_on_no_message &&
-            s_rtc_state.has_reaction &&
+            s_rtc_state.content_type != DISPLAY_CONTENT_NONE &&
             !s_rtc_state.showing_connection_lost) {
             ESP_LOGI(TAG, "Preserving display — will update on new message only");
             skip_display_refresh = true;
@@ -1085,6 +1140,40 @@ extern "C" void app_main(void)
 
     /* 9. Initialize power manager (battery ADC, thresholds) */
     ESP_ERROR_CHECK(power_manager_init());
+
+    /* 9a. Critical battery check on wake BEFORE WiFi connection.
+     * WiFi is the most power-hungry operation — skip it if battery is critically low.
+     *
+     * Hysteresis: If we previously entered critical sleep (was_critical_battery),
+     * require battery to reach BATTERY_RECOVERY_MV (~20%) before allowing boot.
+     * This prevents oscillation where voltage sag under WiFi load drops below 15%,
+     * device sleeps, voltage recovers to 16%, device boots, WiFi drops it again. */
+    if (is_deep_sleep_wake && power_manager_get_source() == POWER_SOURCE_BATTERY) {
+        int threshold = s_rtc_state.was_critical_battery
+            ? BATTERY_RECOVERY_MV    // Previously critical: require ~20% to exit
+            : BATTERY_CRITICAL_MV;   // Normal wake: 15% entry threshold
+        int mv = power_manager_get_battery_mv();
+        if (mv > 0 && mv < threshold) {
+            ESP_LOGW(TAG, "Critical battery on wake (%d mV, threshold %d mV) — sleeping",
+                     mv, threshold);
+            if (!s_rtc_state.was_critical_battery) {
+                // First time entering critical state — show warning screen
+                display_event_t bat_evt = {};
+                bat_evt.type = DISPLAY_EVT_LOW_BATTERY;
+                display_manager_render(&bat_evt);
+                vTaskDelay(pdMS_TO_TICKS(5000));  // Let e-paper finish refresh
+                s_rtc_state.was_critical_battery = true;
+            }
+            // Already showing low battery screen from prior cycle — skip redundant refresh
+            power_manager_deep_sleep(0);      // Indefinite — button wake only
+            // Does not return
+        }
+        // Battery recovered above threshold — clear critical flag and proceed
+        if (s_rtc_state.was_critical_battery) {
+            ESP_LOGI(TAG, "Battery recovered (%d mV >= %d mV) — clearing critical flag", mv, threshold);
+            s_rtc_state.was_critical_battery = false;
+        }
+    }
 
     /* 9b. Network diagnostics (cold boot only, before button_task starts).
      * Hold button 3-15s during power-on to enter diagnostics mode.

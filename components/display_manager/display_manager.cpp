@@ -173,6 +173,7 @@ namespace LockIcons {
 static void render_status_4line(const char *line1, const char *line2,
                                 const char *line3, const char *line4,
                                 bool show_lock);
+static void render_broadcast(const display_event_t *evt);
 
 /* =========================================================================
  * Display driver helpers — direct CalEPD access
@@ -520,6 +521,122 @@ static void render_reaction(const reaction_data_t *reaction)
         plat[0] = (char)toupper((unsigned char)plat[0]);
         display.setCursor(10, display.height() - 14);
         display.print(plat);
+    }
+
+    display.update();
+}
+
+/**
+ * Render a broadcast alert — text-only, full display width.
+ * Layout:
+ *   +--------------------------------------------------+
+ *   | [lock 5,5]     BATTERY        [ooo battery]      |
+ *   |                                                   |
+ *   | Source Name (bold, x=10, y=42)                    |
+ *   | Message line 1 (regular, x=10, y=62)             |
+ *   | Message line 2 (regular, x=10, y=80)             |
+ *   |                                  via Pebl (y=100) |
+ *   +--------------------------------------------------+
+ */
+static void render_broadcast(const display_event_t *evt)
+{
+    const auto *b = &evt->data.broadcast;
+    ESP_LOGI(TAG, "Rendering broadcast from %s: %.40s", b->source, b->message);
+
+    display.fillScreen(COLOR_WHITE);
+    display.setTextColor(COLOR_BLACK);
+
+    /* Top strip: lock icon, power status, battery indicator */
+    draw_battery_indicator();
+    draw_power_status_text();
+    if (b->encrypted) {
+        draw_lock_icon();
+    }
+
+    /* Source name — bold, full width */
+    set_font(FONT_SANS_BOLD_9PT);
+    {
+        char truncated[64];
+        truncate_to_fit(truncated, sizeof(truncated), b->source,
+                        10, display.width() - 15);
+        display.setCursor(10, 42);
+        display.print(truncated);
+    }
+
+    /* Message body — regular font, word-wrapped across up to 2 lines.
+     * Uses space-based wrapping (same approach as Arduino/RPi) to avoid
+     * splitting words mid-character with proportional fonts. */
+    set_font(FONT_SANS_9PT);
+    {
+        int16_t max_w = display.width() - 15;
+        const char *msg = b->message;
+        size_t msg_len = strlen(msg);
+
+        /* Check if the full message fits on one line */
+        char full[256];
+        truncate_to_fit(full, sizeof(full), msg, 10, max_w);
+        size_t full_len = strlen(full);
+
+        bool was_truncated = (msg_len > full_len) ||
+            (full_len >= 3 && full[full_len-1] == '.' &&
+             full[full_len-2] == '.' && full[full_len-3] == '.');
+
+        if (!was_truncated) {
+            /* Fits on one line */
+            display.setCursor(10, 62);
+            display.print(full);
+        } else {
+            /* Find a word boundary for the split.
+             * Walk backwards from the truncation point to find the last space. */
+            size_t split = full_len >= 3 ? full_len - 3 : full_len;
+            while (split > 0 && msg[split] != ' ') {
+                split--;
+            }
+            if (split == 0) {
+                /* No space found — fall back to character split */
+                split = full_len >= 3 ? full_len - 3 : full_len;
+            }
+
+            /* Line 1: up to the word boundary */
+            char line1[128];
+            size_t l1_len = split < sizeof(line1) - 1 ? split : sizeof(line1) - 1;
+            memcpy(line1, msg, l1_len);
+            line1[l1_len] = '\0';
+            display.setCursor(10, 62);
+            display.print(line1);
+
+            /* Line 2: remainder, skip leading space, truncated to fit */
+            const char *remainder = msg + split;
+            while (*remainder == ' ') remainder++;
+            if (*remainder != '\0') {
+                char line2[128];
+                truncate_to_fit(line2, sizeof(line2), remainder, 10, max_w);
+                display.setCursor(10, 80);
+                display.print(line2);
+            }
+        }
+    }
+
+    /* Platform label — small font, bottom-left */
+    if (b->platform[0] != '\0') {
+        display.setFont(NULL);
+        char plat[16];
+        strncpy(plat, b->platform, sizeof(plat) - 1);
+        plat[sizeof(plat) - 1] = '\0';
+        plat[0] = (char)toupper((unsigned char)plat[0]);
+        display.setCursor(10, display.height() - 14);
+        display.print(plat);
+    }
+
+    /* "via Pebl" — small font, bottom-right */
+    {
+        display.setFont(NULL);
+        const char *via = "via Pebl";
+        int16_t x1, y1;
+        uint16_t w, h;
+        display.getTextBounds(via, 0, 0, &x1, &y1, &w, &h);
+        display.setCursor(display.width() - (int16_t)w - 5, display.height() - 14);
+        display.print(via);
     }
 
     display.update();
@@ -1263,6 +1380,10 @@ void display_manager_render(display_event_t *evt)
 
     case DISPLAY_EVT_PURCHASE_QR:
         render_purchase_qr(evt->data.purchase.url, evt->data.purchase.device_id);
+        break;
+
+    case DISPLAY_EVT_BROADCAST:
+        render_broadcast(evt);
         break;
 
     case DISPLAY_EVT_DIAGNOSTICS:
