@@ -92,6 +92,7 @@ typedef struct {
             char source[64];    /* sender / alert source label */
             char message[256];  /* broadcast text */
             char platform[16];  /* "slack", "api", etc. */
+            char channel[64];   /* channel name where broadcast originated */
             bool encrypted;     /* show lock icon if true */
         } broadcast;
         struct {

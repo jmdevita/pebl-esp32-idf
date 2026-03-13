@@ -275,7 +275,7 @@ static void handle_reaction_message(const cJSON *source, bool was_encrypted)
  * Broadcasts are text-only (no emoji download). Layout uses full display width.
  *
  * JSON: {"type":"broadcast","message_id":"...","user":"Ops","message":"Alert text",
- *        "platform":"slack","encrypted":false}
+ *        "platform":"slack","channel":"general","encrypted":false}
  */
 static void handle_broadcast_message(const cJSON *source, bool was_encrypted)
 {
@@ -295,6 +295,8 @@ static void handle_broadcast_message(const cJSON *source, bool was_encrypted)
                      source, "message");
     copy_json_string(evt.data.broadcast.platform, sizeof(evt.data.broadcast.platform),
                      source, "platform");
+    copy_json_string(evt.data.broadcast.channel, sizeof(evt.data.broadcast.channel),
+                     source, "channel");
 
     ESP_LOGI(TAG, "Broadcast from %s: %.60s%s",
              evt.data.broadcast.source, evt.data.broadcast.message,

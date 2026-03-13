@@ -527,15 +527,20 @@ static void render_reaction(const reaction_data_t *reaction)
 }
 
 /**
- * Render a broadcast alert — text-only, full display width.
+ * Render a broadcast alert — structured card layout with header bar and message box.
  * Layout:
  *   +--------------------------------------------------+
- *   | [lock 5,5]     BATTERY        [ooo battery]      |
+ *   | [lock]         BATTERY          [ooo]            |
  *   |                                                   |
- *   | Source Name (bold, x=10, y=42)                    |
- *   | Message line 1 (regular, x=10, y=62)             |
- *   | Message line 2 (regular, x=10, y=80)             |
- *   |                                  via Pebl (y=100) |
+ *   | ████████████████████████████████████████████████ |
+ *   | █     #channel  ·  Announcement                █ |
+ *   | ████████████████████████████████████████████████ |
+ *   | ┌──────────────────────────────────────────────┐ |
+ *   | │           Source Name (bold)                 │ |
+ *   | │      Message line 1 (centered)              │ |
+ *   | │      Message line 2 (centered)              │ |
+ *   | └──────────────────────────────────────────────┘ |
+ *   | Platform                                        |
  *   +--------------------------------------------------+
  */
 static void render_broadcast(const display_event_t *evt)
@@ -553,28 +558,67 @@ static void render_broadcast(const display_event_t *evt)
         draw_lock_icon();
     }
 
-    /* Source name — bold, full width */
+    /* Layout constants */
+    const int16_t margin = 5;
+    const int16_t dw = display.width();
+    const int16_t header_y = 26;
+    const int16_t header_h = 20;
+    const int16_t box_y = header_y + header_h;
+    const int16_t box_h = 58;
+    const int16_t box_inner_w = dw - 2 * margin;
+
+    /* Header bar — filled black rectangle with white centered text.
+     * Shows "#channel · Announcement" or just "Announcement" if no channel. */
+    display.fillRect(margin, header_y, box_inner_w, header_h, COLOR_BLACK);
+    {
+        display.setFont(NULL);
+        display.setTextColor(COLOR_WHITE);
+
+        char header_text[96];
+        if (b->channel[0] != '\0') {
+            snprintf(header_text, sizeof(header_text), "#%s  %c  Announcement",
+                     b->channel, 0xF9);  /* 0xF9 = middle dot in default font */
+        } else {
+            snprintf(header_text, sizeof(header_text), "Announcement");
+        }
+
+        int16_t tx, ty;
+        uint16_t tw, th;
+        display.getTextBounds(header_text, 0, 0, &tx, &ty, &tw, &th);
+        int16_t hx = margin + (box_inner_w - (int16_t)tw) / 2;
+        int16_t hy = header_y + (header_h - (int16_t)th) / 2 - ty;
+        display.setCursor(hx, hy);
+        display.print(header_text);
+
+        display.setTextColor(COLOR_BLACK);
+    }
+
+    /* Message box — outlined rectangle below header bar */
+    display.drawRect(margin, box_y, box_inner_w, box_h, COLOR_BLACK);
+
+    /* Source name — bold, centered inside the box */
     set_font(FONT_SANS_BOLD_9PT);
     {
         char truncated[64];
         truncate_to_fit(truncated, sizeof(truncated), b->source,
-                        10, display.width() - 15);
-        display.setCursor(10, 42);
+                        margin + 4, box_inner_w - 8);
+        int16_t sx, sy;
+        uint16_t sw, sh;
+        display.getTextBounds(truncated, 0, 0, &sx, &sy, &sw, &sh);
+        display.setCursor(margin + (box_inner_w - (int16_t)sw) / 2, box_y + 16);
         display.print(truncated);
     }
 
-    /* Message body — regular font, word-wrapped across up to 2 lines.
-     * Uses space-based wrapping (same approach as Arduino/RPi) to avoid
-     * splitting words mid-character with proportional fonts. */
+    /* Message body — regular font, word-wrapped across up to 2 lines, centered.
+     * Uses space-based wrapping to avoid splitting words mid-character. */
     set_font(FONT_SANS_9PT);
     {
-        int16_t max_w = display.width() - 15;
+        int16_t max_w = box_inner_w - 8;
         const char *msg = b->message;
         size_t msg_len = strlen(msg);
 
-        /* Check if the full message fits on one line */
         char full[256];
-        truncate_to_fit(full, sizeof(full), msg, 10, max_w);
+        truncate_to_fit(full, sizeof(full), msg, margin + 4, max_w);
         size_t full_len = strlen(full);
 
         bool was_truncated = (msg_len > full_len) ||
@@ -582,36 +626,43 @@ static void render_broadcast(const display_event_t *evt)
              full[full_len-2] == '.' && full[full_len-3] == '.');
 
         if (!was_truncated) {
-            /* Fits on one line */
-            display.setCursor(10, 62);
+            int16_t mx, my;
+            uint16_t mw, mh;
+            display.getTextBounds(full, 0, 0, &mx, &my, &mw, &mh);
+            display.setCursor(margin + (box_inner_w - (int16_t)mw) / 2, box_y + 34);
             display.print(full);
         } else {
-            /* Find a word boundary for the split.
-             * Walk backwards from the truncation point to find the last space. */
             size_t split = full_len >= 3 ? full_len - 3 : full_len;
             while (split > 0 && msg[split] != ' ') {
                 split--;
             }
             if (split == 0) {
-                /* No space found — fall back to character split */
                 split = full_len >= 3 ? full_len - 3 : full_len;
             }
 
-            /* Line 1: up to the word boundary */
+            /* Line 1 */
             char line1[128];
             size_t l1_len = split < sizeof(line1) - 1 ? split : sizeof(line1) - 1;
             memcpy(line1, msg, l1_len);
             line1[l1_len] = '\0';
-            display.setCursor(10, 62);
-            display.print(line1);
+            {
+                int16_t lx, ly;
+                uint16_t lw, lh;
+                display.getTextBounds(line1, 0, 0, &lx, &ly, &lw, &lh);
+                display.setCursor(margin + (box_inner_w - (int16_t)lw) / 2, box_y + 34);
+                display.print(line1);
+            }
 
-            /* Line 2: remainder, skip leading space, truncated to fit */
+            /* Line 2 */
             const char *remainder = msg + split;
             while (*remainder == ' ') remainder++;
             if (*remainder != '\0') {
                 char line2[128];
-                truncate_to_fit(line2, sizeof(line2), remainder, 10, max_w);
-                display.setCursor(10, 80);
+                truncate_to_fit(line2, sizeof(line2), remainder, margin + 4, max_w);
+                int16_t lx, ly;
+                uint16_t lw, lh;
+                display.getTextBounds(line2, 0, 0, &lx, &ly, &lw, &lh);
+                display.setCursor(margin + (box_inner_w - (int16_t)lw) / 2, box_y + 52);
                 display.print(line2);
             }
         }
@@ -626,17 +677,6 @@ static void render_broadcast(const display_event_t *evt)
         plat[0] = (char)toupper((unsigned char)plat[0]);
         display.setCursor(10, display.height() - 14);
         display.print(plat);
-    }
-
-    /* "via Pebl" — small font, bottom-right */
-    {
-        display.setFont(NULL);
-        const char *via = "via Pebl";
-        int16_t x1, y1;
-        uint16_t w, h;
-        display.getTextBounds(via, 0, 0, &x1, &y1, &w, &h);
-        display.setCursor(display.width() - (int16_t)w - 5, display.height() - 14);
-        display.print(via);
     }
 
     display.update();
