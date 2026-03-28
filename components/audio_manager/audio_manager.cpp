@@ -1,5 +1,9 @@
 /**
- * Audio Manager — plays a startup chime via MAX98357A I2S DAC.
+ * Audio Manager — plays a startup sound via MAX98357A I2S DAC.
+ *
+ * The startup sound is a "water droplet" — a sine wave that sweeps downward
+ * in frequency with exponential amplitude decay, evoking a pebble dropping
+ * into water. On-brand for Pebl.
  *
  * Self-contained: initializes I2S, plays, tears down. No persistent resources.
  * Called once during boot before light sleep is enabled, so no sleep impact.
@@ -25,50 +29,70 @@
 
 static const char *TAG = "AUDIO";
 
-/* Chime parameters: 3 ascending notes, short and pleasant */
 #define SAMPLE_RATE     16000
-#define NOTE_DURATION   2400    /* samples per note = 150ms at 16kHz */
-#define SILENCE_GAP     800     /* samples between notes = 50ms */
-#define FADE_SAMPLES    400     /* fade in/out to avoid clicks = 25ms */
-#define AMPLITUDE       8000    /* volume level (max 32767 for int16_t) */
 
-/* Three ascending notes: C5, E5, G5 (major chord) */
-static const float NOTE_FREQS[] = { 523.25f, 659.25f, 783.99f };
-#define NUM_NOTES (sizeof(NOTE_FREQS) / sizeof(NOTE_FREQS[0]))
+/* Water droplet synthesis parameters.
+ * Models a pebble hitting water: sine wave with downward frequency sweep
+ * and exponential amplitude decay. Two droplets — a primary "plop" and
+ * a quieter secondary ripple — give it a natural feel. */
 
-/* Total PCM buffer size: 3 notes + 2 gaps + trailing silence */
-#define TOTAL_SAMPLES ((NOTE_DURATION * NUM_NOTES) + (SILENCE_GAP * (NUM_NOTES - 1)) + SAMPLE_RATE / 10)
+#define DROP1_SAMPLES   2400    /* Primary droplet: 150ms */
+#define DROP1_FREQ_START 800.0f /* Start frequency (Hz) — initial impact */
+#define DROP1_FREQ_END   200.0f /* End frequency (Hz) — pitch drops as energy dissipates */
+#define DROP1_DECAY      6.0f   /* Exponential decay rate — fast fadeout */
+#define DROP1_AMPLITUDE  10000  /* Volume (max 32767) */
+
+#define DROP2_SAMPLES   1600    /* Secondary ripple: 100ms */
+#define DROP2_FREQ_START 600.0f /* Slightly higher pitch — smaller bubble */
+#define DROP2_FREQ_END   150.0f
+#define DROP2_DECAY      8.0f   /* Faster decay — quieter, shorter */
+#define DROP2_AMPLITUDE  5000   /* Half volume of primary */
+
+#define GAP_SAMPLES     1200    /* 75ms silence between droplets */
+#define TAIL_SAMPLES    1600    /* 100ms trailing silence for DMA flush */
+
+#define TOTAL_SAMPLES   (DROP1_SAMPLES + GAP_SAMPLES + DROP2_SAMPLES + TAIL_SAMPLES)
 
 /**
- * Generate a sine wave note with fade-in/fade-out envelope.
- * Writes samples starting at buf[offset].
+ * Generate a single water droplet sound: a sine wave with downward
+ * frequency sweep and exponential amplitude decay.
+ *
+ * The frequency sweeps logarithmically from freq_start to freq_end,
+ * while amplitude decays exponentially. This models the physics of
+ * a bubble oscillating and losing energy after a pebble breaks the
+ * water surface.
  */
-static int generate_note(int16_t *buf, int offset, float freq_hz)
+static int generate_droplet(int16_t *buf, int offset, int num_samples,
+                            float freq_start, float freq_end,
+                            float decay_rate, int amplitude)
 {
-    for (int i = 0; i < NOTE_DURATION; i++) {
-        /* Sine wave */
-        float sample = sinf(2.0f * M_PI * freq_hz * (float)i / SAMPLE_RATE);
+    float phase = 0.0f;
 
-        /* Fade envelope to avoid clicks */
-        float envelope = 1.0f;
-        if (i < FADE_SAMPLES) {
-            envelope = (float)i / FADE_SAMPLES;
-        } else if (i > NOTE_DURATION - FADE_SAMPLES) {
-            envelope = (float)(NOTE_DURATION - i) / FADE_SAMPLES;
-        }
+    for (int i = 0; i < num_samples; i++) {
+        float t = (float)i / num_samples;  /* 0.0 → 1.0 */
 
-        buf[offset + i] = (int16_t)(sample * envelope * AMPLITUDE);
+        /* Logarithmic frequency sweep: starts fast, slows down */
+        float freq = freq_start * powf(freq_end / freq_start, t);
+
+        /* Accumulate phase for continuous waveform (avoids clicks from
+         * changing frequency mid-cycle) */
+        phase += 2.0f * M_PI * freq / SAMPLE_RATE;
+
+        /* Exponential amplitude decay */
+        float envelope = expf(-decay_rate * t);
+
+        buf[offset + i] = (int16_t)(sinf(phase) * envelope * amplitude);
     }
-    return offset + NOTE_DURATION;
+    return offset + num_samples;
 }
 
 esp_err_t audio_manager_play_startup(void)
 {
-    ESP_LOGI(TAG, "Playing startup chime (I2S DOUT=%d BCLK=%d LRCLK=%d SD_MODE=%d)",
+    ESP_LOGI(TAG, "Playing startup sound (I2S DOUT=%d BCLK=%d LRCLK=%d SD_MODE=%d)",
              CONFIG_AUDIO_I2S_DOUT, CONFIG_AUDIO_I2S_BCLK,
              CONFIG_AUDIO_I2S_LRCLK, CONFIG_AUDIO_SD_MODE_GPIO);
 
-    /* Generate PCM chime data on the stack/heap */
+    /* Generate PCM droplet data */
     int16_t *pcm = (int16_t *)calloc(TOTAL_SAMPLES, sizeof(int16_t));
     if (!pcm) {
         ESP_LOGE(TAG, "Failed to allocate PCM buffer (%d bytes)", (int)(TOTAL_SAMPLES * sizeof(int16_t)));
@@ -76,12 +100,13 @@ esp_err_t audio_manager_play_startup(void)
     }
 
     int pos = 0;
-    for (int n = 0; n < (int)NUM_NOTES; n++) {
-        pos = generate_note(pcm, pos, NOTE_FREQS[n]);
-        if (n < (int)NUM_NOTES - 1) {
-            pos += SILENCE_GAP;  /* silence gap (already zeroed by calloc) */
-        }
-    }
+    pos = generate_droplet(pcm, pos, DROP1_SAMPLES,
+                           DROP1_FREQ_START, DROP1_FREQ_END,
+                           DROP1_DECAY, DROP1_AMPLITUDE);
+    pos += GAP_SAMPLES;  /* silence gap (already zeroed by calloc) */
+    pos = generate_droplet(pcm, pos, DROP2_SAMPLES,
+                           DROP2_FREQ_START, DROP2_FREQ_END,
+                           DROP2_DECAY, DROP2_AMPLITUDE);
     /* Trailing silence already zeroed by calloc */
 
     /* Configure I2S TX channel */
@@ -161,7 +186,7 @@ esp_err_t audio_manager_play_startup(void)
     i2s_del_channel(tx_handle);
     free(pcm);
 
-    ESP_LOGI(TAG, "Startup chime complete");
+    ESP_LOGI(TAG, "Startup sound complete");
     return ESP_OK;
 }
 
