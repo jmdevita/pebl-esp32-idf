@@ -1,9 +1,38 @@
 # Custom PCB (ESP32-S3) target-specific settings
 CONFIG_IDF_TARGET="esp32s3"
 
-# Pin assignments (TBD per final PCB design)
-CONFIG_BOARD_BUTTON_GPIO=0
+# Custom PCB v1.1 pin assignments
+CONFIG_BOARD_BUTTON_GPIO=16
 CONFIG_BOARD_ADC_BATTERY_CHANNEL=0
 
 # ESP32-S3 does not support ext0 wake — use ext1 (bitmask-based)
 CONFIG_BOARD_WAKE_USE_EXT0=n
+
+# Custom PCB v1.1 e-paper SPI pins (ESP32-S3 GPIO9-14)
+CONFIG_EINK_SPI_MOSI=9
+CONFIG_EINK_SPI_CLK=10
+CONFIG_EINK_SPI_CS=11
+CONFIG_EINK_DC=12
+CONFIG_EINK_RST=13
+CONFIG_EINK_BUSY=14
+
+# Custom PCB default display: GDEY0213B74 (2.13" 4-level grayscale, fast refresh)
+CONFIG_DISPLAY_GDEY0213B74=y
+
+# WS2812B notification LED (GPIO18 via BSS138 level shifter)
+CONFIG_LED_ENABLED=y
+CONFIG_LED_GPIO=18
+CONFIG_LED_BRIGHTNESS=20
+CONFIG_LED_TIMEOUT_MINUTES=15
+
+# Mirror console output to USB-C via USB Serial/JTAG (UART remains primary).
+# Allows idf.py monitor over USB-C without a UART adapter. Also ensures the
+# USB Serial/JTAG peripheral is active, which our USB power detection reads.
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# MAX98357A I2S DAC startup chime
+CONFIG_AUDIO_ENABLED=y
+CONFIG_AUDIO_I2S_DOUT=38
+CONFIG_AUDIO_I2S_BCLK=39
+CONFIG_AUDIO_I2S_LRCLK=40
+CONFIG_AUDIO_SD_MODE_GPIO=21

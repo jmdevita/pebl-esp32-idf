@@ -1,0 +1,38 @@
+menu "PEBL LED Notification"
+
+    config LED_ENABLED
+        bool "Enable WS2812B notification LED"
+        default y if IDF_TARGET_ESP32S3
+        default n
+        help
+            Enable the WS2812B addressable RGB LED for reaction notifications.
+            Only available on the custom PCB v1.1 (ESP32-S3) which has a
+            WS2812B-2020 on GPIO18 via BSS138 level shifter.
+
+    config LED_GPIO
+        int "LED data GPIO"
+        depends on LED_ENABLED
+        default 18
+        help
+            GPIO connected to the WS2812B data input (via Q3 BSS138).
+
+    config LED_BRIGHTNESS
+        int "LED brightness (1-255)"
+        depends on LED_ENABLED
+        range 1 255
+        default 20
+        help
+            Maximum brightness scaling factor. Keep low for battery life.
+            WS2812B draws ~1mA per color channel at low brightness,
+            up to ~60mA at full white (255).
+
+    config LED_TIMEOUT_MINUTES
+        int "Auto-off timeout (minutes)"
+        depends on LED_ENABLED
+        range 1 60
+        default 15
+        help
+            LED turns off automatically after this many minutes.
+            Each new notification resets the timer.
+
+endmenu

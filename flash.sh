@@ -82,7 +82,9 @@ success "ESP-IDF v$(idf.py --version 2>/dev/null | head -1 || echo '?') loaded"
 
 # --- Detect USB port ---
 info "Detecting USB serial port..."
-PORTS=($(ls /dev/cu.usbserial-* 2>/dev/null || true))
+# ESP32 (LilyGo T5) uses FTDI/CP2102 → /dev/cu.usbserial-*
+# ESP32-S3 (Custom PCB) uses native USB → /dev/cu.usbmodem*
+PORTS=($(ls /dev/cu.usbserial-* /dev/cu.usbmodem* 2>/dev/null || true))
 
 if [ ${#PORTS[@]} -eq 0 ]; then
     if $DRY_RUN; then
@@ -136,6 +138,51 @@ echo ""
 read -p "  Device name [$DEFAULT_NAME]: " INPUT_NAME
 DEVICE_NAME="${INPUT_NAME:-$DEFAULT_NAME}"
 
+# --- Board selection ---
+# Each board has a fixed set of SPI GPIO pins and a default display variant.
+echo ""
+echo "  Board type:"
+echo "    1) LilyGo T5 V2.3   - ESP32, GDEW0213I5F default"
+echo "    2) Custom PCB v1.1   - ESP32-S3, GDEY0213B74 default"
+echo ""
+
+# Board pin definitions: MOSI, CLK, CS, DC, RST, BUSY, BUTTON_GPIO
+BOARD_NAMES=("LilyGo T5 V2.3" "Custom PCB v1.1")
+BOARD_MOSI=(23 9)
+BOARD_CLK=(18 10)
+BOARD_CS=(5 11)
+BOARD_DC=(17 12)
+BOARD_RST=(16 13)
+BOARD_BUSY=(4 14)
+BOARD_BUTTON=(39 16)
+BOARD_DEFAULT_VARIANT=(2 3)  # index into VARIANT_OPTIONS: 2=GDEW0213I5F, 3=GDEY0213B74
+
+# Detect current board from sdkconfig SPI pins
+DEFAULT_BOARD_NUM=1
+if [ -f "$SDKCONFIG" ]; then
+    if grep -q "CONFIG_EINK_SPI_MOSI=9" "$SDKCONFIG"; then
+        DEFAULT_BOARD_NUM=2
+    fi
+fi
+
+read -p "  Select board [$DEFAULT_BOARD_NUM]: " INPUT_BOARD_NUM
+BOARD_NUM="${INPUT_BOARD_NUM:-$DEFAULT_BOARD_NUM}"
+BOARD_IDX=$((BOARD_NUM-1))
+BOARD_NAME="${BOARD_NAMES[$BOARD_IDX]}"
+
+if [ -z "$BOARD_NAME" ]; then
+    error "Invalid board selection"
+    exit 1
+fi
+
+SPI_MOSI="${BOARD_MOSI[$BOARD_IDX]}"
+SPI_CLK="${BOARD_CLK[$BOARD_IDX]}"
+SPI_CS="${BOARD_CS[$BOARD_IDX]}"
+SPI_DC="${BOARD_DC[$BOARD_IDX]}"
+SPI_RST="${BOARD_RST[$BOARD_IDX]}"
+SPI_BUSY="${BOARD_BUSY[$BOARD_IDX]}"
+BUTTON_GPIO="${BOARD_BUTTON[$BOARD_IDX]}"
+
 echo ""
 echo "  Display variant (compiled into firmware via Kconfig):"
 echo -e "    Current build: ${CYAN}$CURRENT_VARIANT${NC}"
@@ -149,8 +196,8 @@ VARIANT_OPTIONS=("DEPG0213BN" "GDEW0213I5F" "GDEY0213B74")
 VARIANT_CONFIG_NAMES=("lilygo_t5_depg_bw" "lilygo_t5_gdew_4g" "lilygo_t5_gdey_4g")
 VARIANT_KCONFIG=("CONFIG_DISPLAY_DEPG0213BN" "CONFIG_DISPLAY_GDEW0213I5F" "CONFIG_DISPLAY_GDEY0213B74")
 
-# Detect current default from sdkconfig
-DEFAULT_VARIANT_NUM=2
+# Detect current default from sdkconfig, falling back to the board's default
+DEFAULT_VARIANT_NUM="${BOARD_DEFAULT_VARIANT[$BOARD_IDX]}"
 if [ -f "$SDKCONFIG" ]; then
     for i in "${!VARIANT_KCONFIG[@]}"; do
         if grep -q "${VARIANT_KCONFIG[$i]}=y" "$SDKCONFIG"; then
@@ -172,12 +219,17 @@ if [ -z "$DISPLAY_VARIANT" ]; then
     exit 1
 fi
 
-# Check if variant changed — requires rebuild
+# Check if variant or board changed — requires rebuild
 NEEDS_REBUILD=false
 if [ -f "$SDKCONFIG" ]; then
     if ! grep -q "${DISPLAY_KCONFIG}=y" "$SDKCONFIG"; then
         NEEDS_REBUILD=true
         warn "Display variant changed — firmware will be rebuilt"
+    fi
+    # Check if SPI pins changed (board switch)
+    if ! grep -q "CONFIG_EINK_SPI_MOSI=${SPI_MOSI}$" "$SDKCONFIG"; then
+        NEEDS_REBUILD=true
+        warn "Board SPI pins changed — firmware will be rebuilt"
     fi
 else
     NEEDS_REBUILD=true
@@ -204,13 +256,14 @@ echo -e "${BOLD}┌────────────────────�
 echo -e "${BOLD}│  Flash Summary                       │${NC}"
 echo -e "${BOLD}├──────────────────────────────────────┤${NC}"
 printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Port:" "$PORT"
+printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Board:" "$BOARD_NAME"
 printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Name:" "$DEVICE_NAME"
 printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Variant:" "$DISPLAY_VARIANT"
 printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Config name:" "$DISPLAY_VARIANT_CONFIG"
 printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Rotation:" "$DISPLAY_ROTATION"
 printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Device ID:" "(auto from MAC)"
 if $NEEDS_REBUILD; then
-printf "${BOLD}│${NC}  %-14s ${YELLOW}%-22s${NC}${BOLD}│${NC}\n" "Rebuild:" "YES (variant changed)"
+printf "${BOLD}│${NC}  %-14s ${YELLOW}%-22s${NC}${BOLD}│${NC}\n" "Rebuild:" "YES (config changed)"
 fi
 if $FLASH_CONFIG; then
 printf "${BOLD}│${NC}  %-14s ${YELLOW}%-22s${NC}${BOLD}│${NC}\n" "Config:" "OVERWRITE (loses auth)"
@@ -259,7 +312,7 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-# --- Update Kconfig if variant changed ---
+# --- Update Kconfig if variant or board changed ---
 if $NEEDS_REBUILD; then
     echo ""
     info "Setting display variant to $DISPLAY_VARIANT in sdkconfig..."
@@ -275,6 +328,20 @@ if $NEEDS_REBUILD; then
     else
         echo "${DISPLAY_KCONFIG}=y" >> "$SDKCONFIG"
     fi
+
+    # Update SPI GPIO pins and button GPIO for the selected board
+    info "Setting SPI pins for $BOARD_NAME (MOSI=$SPI_MOSI CLK=$SPI_CLK CS=$SPI_CS DC=$SPI_DC RST=$SPI_RST BUSY=$SPI_BUSY)..."
+    SPI_KEYS=("CONFIG_EINK_SPI_MOSI" "CONFIG_EINK_SPI_CLK" "CONFIG_EINK_SPI_CS" "CONFIG_EINK_DC" "CONFIG_EINK_RST" "CONFIG_EINK_BUSY" "CONFIG_BOARD_BUTTON_GPIO")
+    SPI_VALS=("$SPI_MOSI" "$SPI_CLK" "$SPI_CS" "$SPI_DC" "$SPI_RST" "$SPI_BUSY" "$BUTTON_GPIO")
+    for i in "${!SPI_KEYS[@]}"; do
+        KEY="${SPI_KEYS[$i]}"
+        VAL="${SPI_VALS[$i]}"
+        if grep -q "^${KEY}=" "$SDKCONFIG"; then
+            sed -i '' "s/^${KEY}=.*/${KEY}=${VAL}/" "$SDKCONFIG"
+        else
+            echo "${KEY}=${VAL}" >> "$SDKCONFIG"
+        fi
+    done
 fi
 
 # --- Build firmware ---

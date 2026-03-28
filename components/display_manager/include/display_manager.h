@@ -26,6 +26,7 @@ typedef enum {
     DISPLAY_EVT_PURCHASE_QR,    /* "Trial Expired" + purchase QR code */
     DISPLAY_EVT_BROADCAST,     /* Broadcast alert (text-only, full width) */
     DISPLAY_EVT_DIAGNOSTICS,   /* Network diagnostics results */
+    DISPLAY_EVT_POWER_CHANGE,  /* USB↔battery transition — refresh status bar */
 } display_event_type_t;
 
 /**
@@ -98,6 +99,9 @@ typedef struct {
         struct {
             diag_result_t result;
         } diagnostics;
+        struct {
+            bool show_lock;      /* Preserve lock icon state from current display */
+        } power_change;
     } data;
 } display_event_t;
 

@@ -20,6 +20,7 @@
 #include "resilience_manager.h"
 #include "display_manager.h"
 #include "wifi_manager.h"
+#include "led_manager.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -36,14 +37,20 @@
 static const char *TAG = "WS";
 
 /* Connection timing — matches server protocol (not user-configurable).
- * Server sends heartbeats every 30s. Timeout uses 3x interval (90s) to
- * tolerate network jitter and light-sleep wake delays — same 2x-buffer
- * strategy as the Arduino client (which disconnects at 2× its 30s timeout). */
-#define HEARTBEAT_INTERVAL_MS   15000
+ * Server sends heartbeats every 30s. Client sends at the same 30s interval
+ * to maintain bidirectional traffic (prevents NAT timeout on outbound mapping).
+ * Timeout uses 3x server interval (90s) to tolerate network jitter and
+ * light-sleep wake delays. */
+#define HEARTBEAT_INTERVAL_MS   30000
 #define HEARTBEAT_TIMEOUT_MS    90000
 #define WS_INITIAL_RECONNECT_MS 15000
 #define WS_MAX_RECONNECT_MS     60000
-#define WS_PING_INTERVAL_SEC    20
+/* esp_websocket_client ping interval. Set high (120s) rather than matching
+ * server's 20s because: (1) setting 0 falls back to 10s default (worse),
+ * (2) pingpong_timeout_sec defaults to 0 (no dead-connection detection),
+ * (3) server Uvicorn pings (20s) + app heartbeats (30s) already cover
+ * keepalive. Each client ping is a WiFi TX cycle (~50ms @ 100mA). */
+#define WS_PING_INTERVAL_SEC    120
 
 static esp_websocket_client_handle_t s_client = NULL;
 
@@ -59,6 +66,13 @@ static uint32_t s_disconnect_count = 0;  /* Consecutive disconnects — reset on
  * Atomic int because ws_error_code_t may not have atomic support directly. */
 static atomic_int s_pending_error = WS_ERROR_NONE;
 static ws_error_info_t s_error_info = {};
+
+/* Event group for wake-on-event signaling to ws_task.
+ * Set by websocket_manager_set_event_group(), used by WS event handler
+ * to fire bits when errors or firmware updates arrive. */
+static EventGroupHandle_t s_system_events = NULL;
+static EventBits_t s_error_bit = 0;
+static EventBits_t s_firmware_bit = 0;
 
 /* Display queue handle — set by websocket_manager_start(), used by event handler
  * to push reaction events directly (FreeRTOS queues are thread-safe) */
@@ -258,6 +272,15 @@ static void handle_reaction_message(const cJSON *source, bool was_encrypted)
     if (xQueueSend(s_display_queue, &evt, 0) != pdTRUE) {
         ESP_LOGW(TAG, "Display queue full, dropping reaction");
         free(evt.data.reaction.emoji_png_data);
+    } else {
+        /* Notification LED: platform-colored, auto-clears after timeout */
+        if (strcmp(evt.data.reaction.platform, "slack") == 0) {
+            led_manager_notify(74, 21, 75);     /* Slack aubergine */
+        } else if (strcmp(evt.data.reaction.platform, "discord") == 0) {
+            led_manager_notify(88, 101, 242);   /* Discord blurple */
+        } else {
+            led_manager_notify(255, 255, 255);  /* Default white */
+        }
     }
 
     /* Send ACK to server */
@@ -341,6 +364,11 @@ static void handle_firmware_message(const cJSON *root)
     } else {
         atomic_store(&s_pending_firmware_optional, true);
     }
+
+    /* Wake ws_task immediately so firmware updates aren't delayed by poll interval */
+    if (s_system_events) {
+        xEventGroupSetBits(s_system_events, s_firmware_bit);
+    }
 }
 
 /**
@@ -385,6 +413,11 @@ static void handle_error_message(const cJSON *root)
         copy_json_string(s_error_info.device_id, sizeof(s_error_info.device_id),
                          root, "device_id");
         atomic_store(&s_pending_error, WS_ERROR_AUTH_FAILED);
+    }
+
+    /* Wake ws_task immediately so server errors are handled without delay */
+    if (s_system_events) {
+        xEventGroupSetBits(s_system_events, s_error_bit);
     }
 }
 
@@ -703,6 +736,15 @@ void websocket_manager_stop(void)
     s_rx_buffer = NULL;
     s_rx_buffer_len = 0;
     s_rx_buffer_capacity = 0;
+}
+
+void websocket_manager_set_event_group(EventGroupHandle_t events,
+                                        EventBits_t error_bit,
+                                        EventBits_t firmware_bit)
+{
+    s_system_events = events;
+    s_error_bit = error_bit;
+    s_firmware_bit = firmware_bit;
 }
 
 bool websocket_manager_is_connected(void)

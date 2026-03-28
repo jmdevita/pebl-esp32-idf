@@ -11,6 +11,12 @@ CONFIG_ESP_WIFI_SLP_DEFAULT_MAX_ACTIVE_TIME=60
 # --- WiFi ---
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 
+# --- lwIP (light sleep optimization) ---
+# Default is 1 second, which wakes the CPU from light sleep every second
+# to check DHCP lease renewal. DHCP leases are typically hours long.
+# Kconfig range caps this at 10s (range 1-10). Set to max allowed.
+CONFIG_LWIP_DHCP_COARSE_TIMER_SECS=10
+
 # --- mbedTLS (ECDH + AES-GCM encryption) ---
 CONFIG_MBEDTLS_ECDH_C=y
 CONFIG_MBEDTLS_GCM_C=y

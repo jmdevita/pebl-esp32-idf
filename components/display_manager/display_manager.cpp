@@ -1366,6 +1366,35 @@ esp_err_t display_manager_init(bool is_deep_sleep_wake)
     return ESP_OK;
 }
 
+/**
+ * Partial refresh of just the top status bar (battery indicator, power text, lock icon).
+ * Uses UC8151D partial update commands for ~300ms refresh vs ~2100ms full refresh.
+ * Only redraws the top 32 pixel rows — the rest of the display is untouched.
+ */
+static void render_power_change(bool show_lock)
+{
+    /* Draw into mono buffer for partial refresh.
+     * Partial refresh is mono-only (uses _buffer, not _buffer1/_buffer2).
+     * Restore grayscale mode afterward so subsequent reaction renders use 4-gray. */
+    display.setMonoMode(true);
+
+    /* Clear the top bar region in the framebuffer (32 rows, byte-aligned) */
+    display.fillRect(0, 0, display.width(), 32, EPD_WHITE);
+
+    /* Redraw top bar elements — same functions used by all other render paths */
+    draw_battery_indicator();
+    draw_power_status_text();
+    if (show_lock) {
+        draw_lock_icon();
+    }
+
+    /* Partial refresh — only sends the top 32 rows to the controller */
+    display.updateWindow(0, 0, display.width(), 32);
+
+    /* Restore grayscale mode for subsequent reaction/broadcast renders */
+    display.setMonoMode(false);
+}
+
 void display_manager_render(display_event_t *evt)
 {
     /* Acquire PM lock to prevent light sleep during SPI e-paper refresh.
@@ -1428,6 +1457,10 @@ void display_manager_render(display_event_t *evt)
 
     case DISPLAY_EVT_DIAGNOSTICS:
         render_diagnostics(&evt->data.diagnostics.result);
+        break;
+
+    case DISPLAY_EVT_POWER_CHANGE:
+        render_power_change(evt->data.power_change.show_lock);
         break;
     }
 

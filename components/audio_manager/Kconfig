@@ -1,0 +1,35 @@
+menu "PEBL Audio"
+
+    config AUDIO_ENABLED
+        bool "Enable startup sound (MAX98357A I2S DAC)"
+        default y if IDF_TARGET_ESP32S3
+        default n
+        help
+            Play a short chime on boot via the MAX98357A I2S DAC.
+            Only available on the custom PCB v1.1 (ESP32-S3) which has
+            MAX98357A on GPIO38/39/40 with SD_MODE on GPIO21.
+
+    config AUDIO_I2S_DOUT
+        int "I2S data out GPIO (DIN on MAX98357A)"
+        depends on AUDIO_ENABLED
+        default 38
+
+    config AUDIO_I2S_BCLK
+        int "I2S bit clock GPIO (BCLK on MAX98357A)"
+        depends on AUDIO_ENABLED
+        default 39
+
+    config AUDIO_I2S_LRCLK
+        int "I2S word select GPIO (LRCLK on MAX98357A)"
+        depends on AUDIO_ENABLED
+        default 40
+
+    config AUDIO_SD_MODE_GPIO
+        int "DAC shutdown/enable GPIO (SD_MODE on MAX98357A)"
+        depends on AUDIO_ENABLED
+        default 21
+        help
+            HIGH = DAC enabled, LOW = DAC shutdown (saves ~2mA).
+            Kept LOW except during active playback.
+
+endmenu

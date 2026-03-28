@@ -52,9 +52,13 @@ static int probe_adc_channel(adc_channel_t ch)
 
 esp_err_t board_init(void)
 {
-    ESP_LOGI(TAG, "Initializing board HAL (button=%d, adc_ch=%d, ext0=%s)",
+    ESP_LOGI(TAG, "Initializing board HAL (button=%d, adc_ch=%d, wake=%s)",
              CONFIG_BOARD_BUTTON_GPIO, CONFIG_BOARD_ADC_BATTERY_CHANNEL,
-             CONFIG_BOARD_WAKE_USE_EXT0 ? "yes" : "no");
+#if CONFIG_BOARD_WAKE_USE_EXT0
+             "ext0");
+#else
+             "ext1");
+#endif
 
     /* Initialize ADC for battery monitoring */
     adc_oneshot_unit_init_cfg_t adc_cfg = {
@@ -216,5 +220,9 @@ void board_configure_wake_sources(int button_gpio, uint64_t sleep_duration_us)
 
     ESP_LOGI(TAG, "Wake sources configured: timer=%llu us, button=GPIO %d (%s)",
              sleep_duration_us, button_gpio,
-             CONFIG_BOARD_WAKE_USE_EXT0 ? "ext0" : "ext1");
+#if CONFIG_BOARD_WAKE_USE_EXT0
+             "ext0");
+#else
+             "ext1");
+#endif
 }

@@ -38,6 +38,16 @@ typedef struct {
 ws_error_code_t websocket_manager_get_pending_error(ws_error_info_t *info);
 
 /**
+ * Register the system event group for wake-on-event signaling.
+ * Call before websocket_manager_start(). The WS event handler will set
+ * the specified bits when server errors or firmware updates arrive,
+ * allowing ws_task to wake immediately instead of polling.
+ */
+void websocket_manager_set_event_group(EventGroupHandle_t events,
+                                        EventBits_t error_bit,
+                                        EventBits_t firmware_bit);
+
+/**
  * Start WebSocket connection to server.
  * Uses esp_websocket_client which runs its own internal task for I/O.
  * Events are dispatched to the ws_event_handler callback.

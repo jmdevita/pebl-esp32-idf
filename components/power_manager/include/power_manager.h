@@ -65,12 +65,13 @@ typedef struct {
 esp_err_t power_manager_init(void);
 
 /**
- * Periodic power check (called from power_task every 10s).
+ * Periodic power check (called from power_task every 5 minutes).
  * Reads battery voltage, determines power source, adjusts CPU frequency.
+ * Returns true if power source changed (USB↔battery transition).
  * Caller should check power_manager_is_critical_battery() afterward and
  * handle deep sleep (with display warning) if true.
  */
-void power_manager_check(EventGroupHandle_t system_events);
+bool power_manager_check(EventGroupHandle_t system_events);
 
 /**
  * Handle physical button press (called from button_task).

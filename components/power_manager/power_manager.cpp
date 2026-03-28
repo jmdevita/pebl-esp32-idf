@@ -22,7 +22,29 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#if CONFIG_IDF_TARGET_ESP32S3
+#include "soc/usb_serial_jtag_struct.h"
+#endif
+
 static const char *TAG = "POWER";
+
+#if CONFIG_IDF_TARGET_ESP32S3
+/**
+ * Detect USB host connection by checking the USB Serial/JTAG peripheral's
+ * SOF (Start of Frame) counter. A USB host sends SOF packets every 1ms.
+ * If the frame counter increments between two reads, a host is connected.
+ *
+ * This approach requires no driver init, no TinyUSB, and no VBUS sense GPIO.
+ * The USB Serial/JTAG peripheral is always clocked on ESP32-S3.
+ */
+static bool usb_host_detected(void)
+{
+    uint32_t frame1 = USB_SERIAL_JTAG.fram_num.sof_frame_index;
+    vTaskDelay(pdMS_TO_TICKS(3));
+    uint32_t frame2 = USB_SERIAL_JTAG.fram_num.sof_frame_index;
+    return (frame2 != frame1);
+}
+#endif
 
 /* Track the last power source to detect transitions and reconfigure
  * CPU frequency only when the source actually changes. */
@@ -60,9 +82,19 @@ esp_err_t power_manager_init(void)
 
     /* Initial battery reading */
     int raw_mv = board_adc_read_battery_mv();
+    if (raw_mv < 0) {
+        ESP_LOGW(TAG, "ADC read failed on init, defaulting to 0 mV");
+        raw_mv = 0;
+    }
     s_battery_mv = raw_mv * BATTERY_VOLTAGE_DIVIDER_RATIO;
 
-    /* Determine initial power source */
+    /* Determine initial power source.
+     * ESP32-S3 (custom PCB): detect USB host via SOF frame counter — reliable
+     * regardless of battery charge level.
+     * ESP32 (LilyGo T5): infer from battery voltage threshold (no USB sense). */
+#if CONFIG_IDF_TARGET_ESP32S3
+    s_source = usb_host_detected() ? POWER_SOURCE_USB : POWER_SOURCE_BATTERY;
+#else
     if (s_battery_mv > BATTERY_USB_THRESHOLD) {
         s_source = POWER_SOURCE_USB;
     } else if (s_battery_mv > BATTERY_NO_BATTERY_MIN && s_battery_mv < BATTERY_NO_BATTERY_MAX) {
@@ -70,6 +102,7 @@ esp_err_t power_manager_init(void)
     } else {
         s_source = POWER_SOURCE_UNKNOWN;
     }
+#endif
 
     ESP_LOGI(TAG, "Power init: %d mV, %d%%, source=%s",
              s_battery_mv, voltage_to_percent(s_battery_mv),
@@ -79,24 +112,39 @@ esp_err_t power_manager_init(void)
     return ESP_OK;
 }
 
-void power_manager_check(EventGroupHandle_t system_events)
+bool power_manager_check(EventGroupHandle_t system_events)
 {
     /* Read battery voltage */
     int raw_mv = board_adc_read_battery_mv();
     if (raw_mv < 0) {
-        return;
+        return false;
     }
     s_battery_mv = raw_mv * BATTERY_VOLTAGE_DIVIDER_RATIO;
 
-    /* Update power source with hysteresis */
+    /* Update power source.
+     * ESP32-S3: direct USB host detection via SOF counter.
+     * ESP32: voltage threshold with hysteresis to avoid flip-flopping. */
+    bool transition = false;
+#if CONFIG_IDF_TARGET_ESP32S3
+    power_source_t new_source = usb_host_detected() ? POWER_SOURCE_USB : POWER_SOURCE_BATTERY;
+    if (new_source != s_source) {
+        s_source = new_source;
+        transition = true;
+        ESP_LOGI(TAG, "Power source: %s (%d mV)",
+                 s_source == POWER_SOURCE_USB ? "USB" : "battery", s_battery_mv);
+    }
+#else
     if (s_source == POWER_SOURCE_BATTERY && s_battery_mv > BATTERY_USB_HYSTERESIS) {
         s_source = POWER_SOURCE_USB;
+        transition = true;
         ESP_LOGI(TAG, "Power source: USB detected (%d mV)", s_battery_mv);
     } else if (s_source == POWER_SOURCE_USB && s_battery_mv < BATTERY_USB_THRESHOLD) {
         s_source = POWER_SOURCE_BATTERY;
+        transition = true;
         ESP_LOGI(TAG, "Power source: battery (%d mV, %d%%)",
                  s_battery_mv, voltage_to_percent(s_battery_mv));
     }
+#endif
 
     /* CPU frequency scaling on power source transition.
      * Battery: cap at 160MHz (~30% power savings during active processing).
@@ -126,6 +174,8 @@ void power_manager_check(EventGroupHandle_t system_events)
     ESP_LOGD(TAG, "Battery: %d mV (%d%%), source: %s",
              s_battery_mv, voltage_to_percent(s_battery_mv),
              s_source == POWER_SOURCE_USB ? "USB" : "battery");
+
+    return transition;
 }
 
 bool power_manager_is_critical_battery(void)

@@ -10,6 +10,8 @@ idf_component_register(
         security_manager
         ota_manager
         power_manager
+        led_manager
+        audio_manager
         resilience_manager
         pairing_manager
         timezone_manager

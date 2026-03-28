@@ -46,6 +46,8 @@
 #include "security_manager.h"
 #include "ota_manager.h"
 #include "power_manager.h"
+#include "led_manager.h"
+#include "audio_manager.h"
 #include "resilience_manager.h"
 #include "pairing_manager.h"
 #include "timezone_manager.h"
@@ -105,22 +107,58 @@ static EventGroupHandle_t system_events = NULL;
 static SemaphoreHandle_t button_semaphore = NULL;
 
 /* Event group bits */
-#define EVT_WIFI_CONNECTED    BIT0
-#define EVT_WS_CONNECTED      BIT1
-#define EVT_PAIRING_COMPLETE  BIT2
-#define EVT_SHUTDOWN_REQUEST  BIT3
-#define EVT_PAIRING_REQUEST   BIT4  /* button_task → ws_task: enter pairing mode */
-#define EVT_WIFI_PORTAL_REQUEST BIT5  /* button_task → ws_task: enter WiFi provisioning */
+#define EVT_WIFI_CONNECTED      BIT0
+#define EVT_WS_CONNECTED        BIT1
+#define EVT_PAIRING_COMPLETE    BIT2
+#define EVT_SHUTDOWN_REQUEST    BIT3
+#define EVT_PAIRING_REQUEST     BIT4   /* button_task → ws_task: enter pairing mode */
+#define EVT_WIFI_PORTAL_REQUEST BIT5   /* button_task → ws_task: enter WiFi provisioning */
+#define EVT_WS_ERROR            BIT6   /* WS callback received server error */
+#define EVT_WS_FIRMWARE         BIT7   /* WS callback received firmware_update message */
+#define EVT_HEALTH_CHECK        BIT8   /* esp_timer: run resilience check (30s periodic) */
+#define EVT_HEARTBEAT_DUE       BIT9   /* esp_timer: send heartbeat + check timeout (30s periodic) */
+#define EVT_OTA_PERIODIC        BIT10  /* esp_timer: 24h OTA check (one-shot, re-armed) */
 
 /* Display queue depth: buffer a few reactions while display is refreshing */
 #define DISPLAY_QUEUE_DEPTH  4
 
 /* Timeout for task shutdown checks — allows tasks to notice EVT_SHUTDOWN_REQUEST
- * instead of blocking forever on portMAX_DELAY */
-#define TASK_SHUTDOWN_CHECK_MS  5000
+ * instead of blocking forever on portMAX_DELAY. 30s is acceptable because
+ * shutdown only occurs before deep sleep (minutes-to-hours), and button_task
+ * still responds instantly to presses via GPIO ISR semaphore. */
+#define TASK_SHUTDOWN_CHECK_MS  30000
 
 /* Forward declaration — defined before app_main(), used by ws_task and power_task */
 static void graceful_shutdown(void);
+
+/* ---------- esp_timer handles for event-driven ws_task ----------
+ * All callbacks run in the esp_timer task context (CONFIG_ESP_TIMER_ISR_DISPATCH
+ * is not set), so xEventGroupSetBits() is safe (not the FromISR variant). */
+static esp_timer_handle_t s_health_timer = NULL;
+static esp_timer_handle_t s_heartbeat_timer = NULL;
+static esp_timer_handle_t s_ota_timer = NULL;
+static esp_timer_handle_t s_firmware_reeval_timer = NULL;
+
+static void health_timer_cb(void *arg) {
+    xEventGroupSetBits((EventGroupHandle_t)arg, EVT_HEALTH_CHECK);
+}
+static void heartbeat_timer_cb(void *arg) {
+    xEventGroupSetBits((EventGroupHandle_t)arg, EVT_HEARTBEAT_DUE);
+}
+static void ota_timer_cb(void *arg) {
+    xEventGroupSetBits((EventGroupHandle_t)arg, EVT_OTA_PERIODIC);
+}
+static void firmware_reeval_cb(void *arg) {
+    xEventGroupSetBits((EventGroupHandle_t)arg, EVT_WS_FIRMWARE);
+}
+
+/** Stop all ws_task timers — call before graceful_shutdown() or break paths. */
+static void stop_ws_timers(void) {
+    if (s_health_timer) esp_timer_stop(s_health_timer);
+    if (s_heartbeat_timer) esp_timer_stop(s_heartbeat_timer);
+    if (s_ota_timer) esp_timer_stop(s_ota_timer);
+    if (s_firmware_reeval_timer) esp_timer_stop(s_firmware_reeval_timer);
+}
 
 /**
  * OTA download progress callback — updates e-paper display at 20% intervals.
@@ -233,6 +271,34 @@ static void ws_task(void *arg)
 
     websocket_manager_start(display_queue);
 
+    /* Register event group so WS callbacks can wake ws_task immediately */
+    websocket_manager_set_event_group(system_events, EVT_WS_ERROR, EVT_WS_FIRMWARE);
+
+    /* Create periodic timers for event-driven architecture.
+     * All callbacks run in esp_timer task context (not ISR), so
+     * xEventGroupSetBits() is safe. See CONFIG_ESP_TIMER_ISR_DISPATCH. */
+    {
+        esp_timer_create_args_t args = {};
+
+        args.callback = health_timer_cb; args.arg = system_events; args.name = "health";
+        args.skip_unhandled_events = true;  /* Event bits are level-triggered; re-setting is a no-op */
+        esp_timer_create(&args, &s_health_timer);
+        esp_timer_start_periodic(s_health_timer, 30 * 1000000);  /* 30 seconds */
+
+        args.callback = heartbeat_timer_cb; args.arg = system_events; args.name = "heartbeat";
+        args.skip_unhandled_events = true;
+        esp_timer_create(&args, &s_heartbeat_timer);
+        esp_timer_start_periodic(s_heartbeat_timer, 30 * 1000000);  /* 30 seconds — matches server interval */
+
+        args.callback = ota_timer_cb; args.arg = system_events; args.name = "ota_24h";
+        esp_timer_create(&args, &s_ota_timer);
+        esp_timer_start_once(s_ota_timer, 24LL * 60 * 60 * 1000000);  /* 24 hours */
+
+        args.callback = firmware_reeval_cb; args.arg = system_events; args.name = "fw_reeval";
+        esp_timer_create(&args, &s_firmware_reeval_timer);
+        /* One-shot, started only when optional firmware is deferred */
+    }
+
     /* Track DEVICE_NOT_LINKED attempts to prevent infinite pairing loop on battery.
      * After MAX attempts, show help screen and deep sleep so user can intervene. */
     uint8_t device_not_linked_count = 0;
@@ -242,164 +308,181 @@ static void ws_task(void *arg)
     uint8_t registration_error_count = 0;
     const uint8_t MAX_REGISTRATION_RETRIES = 3;
 
-    /* Task loop handled internally by esp_websocket_client's own task.
-     * This task monitors connection health, sends periodic heartbeats,
-     * and executes resilience escalation actions when connectivity degrades. */
-    while (!(xEventGroupGetBits(system_events) & EVT_SHUTDOWN_REQUEST)) {
-        websocket_manager_process(system_events);
+    /* Event-driven main loop: ws_task blocks until an event bit fires.
+     * Timer-driven events: health check (5s), heartbeat (15s), OTA (24h).
+     * Callback-driven events: server errors, firmware updates (from WS handler).
+     * Button-driven events: pairing, WiFi portal (from button_task ISR).
+     *
+     * pdTRUE clears matched bits on return. EVT_PAIRING_COMPLETE and
+     * EVT_WIFI_CONNECTED are NOT in WAKE_BITS, so they are unaffected. */
+    const EventBits_t WAKE_BITS =
+        EVT_SHUTDOWN_REQUEST | EVT_PAIRING_REQUEST | EVT_WIFI_PORTAL_REQUEST |
+        EVT_WS_ERROR | EVT_WS_FIRMWARE |
+        EVT_HEALTH_CHECK | EVT_HEARTBEAT_DUE | EVT_OTA_PERIODIC;
 
-        /* Check for server error messages (DEVICE_NOT_LINKED, TRIAL_EXPIRED, etc.).
-         * These arrive on the WS client's internal task and are stored atomically
-         * for consumption here, where we can take blocking actions. */
-        ws_error_info_t error_info;
-        ws_error_code_t ws_error = websocket_manager_get_pending_error(&error_info);
+    while (true) {
+        EventBits_t bits = xEventGroupWaitBits(system_events,
+            WAKE_BITS, pdTRUE, pdFALSE, portMAX_DELAY);
 
-        if (ws_error == WS_ERROR_DEVICE_NOT_LINKED) {
-            device_not_linked_count++;
-
-            if (device_not_linked_count > MAX_DEVICE_NOT_LINKED_ATTEMPTS) {
-                ESP_LOGW(TAG, "Too many DEVICE_NOT_LINKED errors — sleeping");
-                display_event_t evt = {};
-                evt.type = DISPLAY_EVT_STATUS;
-                snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Pairing needed");
-                snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "Hold button 3-9 sec");
-                snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "to re-enter pairing");
-                xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
-                vTaskDelay(pdMS_TO_TICKS(5000));
-                graceful_shutdown();
-                power_manager_deep_sleep(15ULL * 60 * 1000000);  /* 15 minutes */
-                break;
-            }
-
-            ESP_LOGI(TAG, "Device not linked — entering pairing mode");
-            websocket_manager_stop();
-
-            /* Clear EVT_PAIRING_COMPLETE so we can wait for it again */
-            xEventGroupClearBits(system_events, EVT_PAIRING_COMPLETE);
-            pairing_manager_start(display_queue, system_events);
-            xEventGroupWaitBits(system_events, EVT_PAIRING_COMPLETE,
-                                pdFALSE, pdTRUE, portMAX_DELAY);
-
-            security_manager_reset_key_uploaded();
-
-            ESP_LOGI(TAG, "Pairing complete — restarting");
-            vTaskDelay(pdMS_TO_TICKS(100));  /* Allow log to flush */
-            esp_restart();
+        /* --- Shutdown (highest priority) --- */
+        if (bits & EVT_SHUTDOWN_REQUEST) {
             break;
+        }
 
-        } else if (ws_error == WS_ERROR_TRIAL_EXPIRED) {
-            const app_config_t *trial_cfg = config_manager_get_config();
+        /* --- Heartbeat send + timeout check (30s timer) --- */
+        if (bits & EVT_HEARTBEAT_DUE) {
+            websocket_manager_process(system_events);
+        }
 
-            /* Show purchase QR screen if server provided a URL */
-            if (error_info.purchase_url[0] != '\0') {
-                display_event_t evt = {};
-                evt.type = DISPLAY_EVT_PURCHASE_QR;
-                const char *id = error_info.device_id[0] ? error_info.device_id : trial_cfg->device.id;
+        /* --- Server errors (immediate, from WS callback) --- */
+        if (bits & EVT_WS_ERROR) {
+            ws_error_info_t error_info;
+            ws_error_code_t ws_error = websocket_manager_get_pending_error(&error_info);
 
-                /* Append device_id as query param so checkout auto-links to this device.
-                 * Truncation is acceptable here — URL will still load, just may lose
-                 * the device_id param if the base URL is very long.
-                 * Budget: 90 (url) + 1 (?) + 10 (device_id=) + 24 (id) + 1 (nul) = 126 ≤ 128 */
-                snprintf(evt.data.purchase.url, sizeof(evt.data.purchase.url),
-                         "%.90s%cdevice_id=%.24s",
-                         error_info.purchase_url,
-                         strchr(error_info.purchase_url, '?') ? '&' : '?',
-                         id);
-                strncpy(evt.data.purchase.device_id, id, sizeof(evt.data.purchase.device_id) - 1);
-                xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
-            } else {
-                display_event_t evt = {};
-                evt.type = DISPLAY_EVT_STATUS;
-                snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Trial Expired");
-                snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "Purchase key at:");
-                snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "See purchase info");
-                const char *id = error_info.device_id[0] ? error_info.device_id : trial_cfg->device.id;
-                snprintf(evt.data.status.line4, sizeof(evt.data.status.line4), "ID: %.59s", id);
-                xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
-            }
+            if (ws_error == WS_ERROR_DEVICE_NOT_LINKED) {
+                device_not_linked_count++;
 
-            ESP_LOGI(TAG, "Trial expired — entering 60-minute deep sleep");
-            vTaskDelay(pdMS_TO_TICKS(2000));  /* Show message before sleeping */
-            graceful_shutdown();
-            power_manager_deep_sleep(60ULL * 60 * 1000000);  /* 60 minutes */
-            break;
+                if (device_not_linked_count > MAX_DEVICE_NOT_LINKED_ATTEMPTS) {
+                    ESP_LOGW(TAG, "Too many DEVICE_NOT_LINKED errors — sleeping");
+                    display_event_t evt = {};
+                    evt.type = DISPLAY_EVT_STATUS;
+                    snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Pairing needed");
+                    snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "Hold button 3-9 sec");
+                    snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "to re-enter pairing");
+                    xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
+                    vTaskDelay(pdMS_TO_TICKS(5000));
+                    stop_ws_timers();
+                    graceful_shutdown();
+                    power_manager_deep_sleep(15ULL * 60 * 1000000);  /* 15 minutes */
+                    break;
+                }
 
-        } else if (ws_error == WS_ERROR_DEVICE_NOT_REGISTERED) {
-            const app_config_t *reg_cfg = config_manager_get_config();
-            registration_error_count++;
-            const char *id = error_info.device_id[0] ? error_info.device_id : reg_cfg->device.id;
+                ESP_LOGI(TAG, "Device not linked — entering pairing mode");
+                esp_timer_stop(s_health_timer);
+                esp_timer_stop(s_heartbeat_timer);
+                websocket_manager_stop();
 
-            if (registration_error_count < MAX_REGISTRATION_RETRIES) {
-                display_event_t evt = {};
-                evt.type = DISPLAY_EVT_STATUS;
-                snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Connecting...");
-                snprintf(evt.data.status.line2, sizeof(evt.data.status.line2),
-                         "Attempt %d of %d", registration_error_count, MAX_REGISTRATION_RETRIES - 1);
-                snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "ID: %.59s", id);
-                snprintf(evt.data.status.line4, sizeof(evt.data.status.line4), "Checking registration");
-                xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
-                vTaskDelay(pdMS_TO_TICKS(30000));  /* 30 seconds between retries */
-            } else {
-                display_event_t evt = {};
-                evt.type = DISPLAY_EVT_STATUS;
-                snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Setup Required");
-                snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "ID: %.59s", id);
-                snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "Complete registration");
-                snprintf(evt.data.status.line4, sizeof(evt.data.status.line4), "then RESTART device");
-                xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
+                xEventGroupClearBits(system_events, EVT_PAIRING_COMPLETE);
+                pairing_manager_start(display_queue, system_events);
+                xEventGroupWaitBits(system_events, EVT_PAIRING_COMPLETE,
+                                    pdFALSE, pdTRUE, portMAX_DELAY);
 
-                ESP_LOGI(TAG, "Registration failed — entering 10-minute deep sleep");
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                graceful_shutdown();
-                power_manager_deep_sleep(10ULL * 60 * 1000000);  /* 10 minutes */
+                security_manager_reset_key_uploaded();
+
+                ESP_LOGI(TAG, "Pairing complete — restarting");
+                vTaskDelay(pdMS_TO_TICKS(100));
+                esp_restart();
                 break;
-            }
 
-        } else if (ws_error == WS_ERROR_AUTH_FAILED) {
-            registration_error_count++;
+            } else if (ws_error == WS_ERROR_TRIAL_EXPIRED) {
+                const app_config_t *trial_cfg = config_manager_get_config();
 
-            if (registration_error_count < MAX_REGISTRATION_RETRIES) {
-                display_event_t evt = {};
-                evt.type = DISPLAY_EVT_STATUS;
-                snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Auth Failed");
-                snprintf(evt.data.status.line2, sizeof(evt.data.status.line2),
-                         "Attempt %d of %d", registration_error_count, MAX_REGISTRATION_RETRIES - 1);
-                snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "Check auth_token");
-                snprintf(evt.data.status.line4, sizeof(evt.data.status.line4), "in config.json");
-                xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
-                vTaskDelay(pdMS_TO_TICKS(30000));  /* 30 seconds between retries */
-            } else {
-                display_event_t evt = {};
-                evt.type = DISPLAY_EVT_STATUS;
-                snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Auth Failed");
-                snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "Check auth_token");
-                snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "in config.json");
-                snprintf(evt.data.status.line4, sizeof(evt.data.status.line4), "then RESTART device");
-                xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
+                if (error_info.purchase_url[0] != '\0') {
+                    display_event_t evt = {};
+                    evt.type = DISPLAY_EVT_PURCHASE_QR;
+                    const char *id = error_info.device_id[0] ? error_info.device_id : trial_cfg->device.id;
+                    snprintf(evt.data.purchase.url, sizeof(evt.data.purchase.url),
+                             "%.90s%cdevice_id=%.24s",
+                             error_info.purchase_url,
+                             strchr(error_info.purchase_url, '?') ? '&' : '?',
+                             id);
+                    strncpy(evt.data.purchase.device_id, id, sizeof(evt.data.purchase.device_id) - 1);
+                    xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
+                } else {
+                    display_event_t evt = {};
+                    evt.type = DISPLAY_EVT_STATUS;
+                    snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Trial Expired");
+                    snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "Purchase key at:");
+                    snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "See purchase info");
+                    const char *id = error_info.device_id[0] ? error_info.device_id : trial_cfg->device.id;
+                    snprintf(evt.data.status.line4, sizeof(evt.data.status.line4), "ID: %.59s", id);
+                    xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
+                }
 
-                ESP_LOGI(TAG, "Auth failed — entering 10-minute deep sleep");
+                ESP_LOGI(TAG, "Trial expired — entering 60-minute deep sleep");
                 vTaskDelay(pdMS_TO_TICKS(2000));
+                stop_ws_timers();
                 graceful_shutdown();
-                power_manager_deep_sleep(10ULL * 60 * 1000000);  /* 10 minutes */
+                power_manager_deep_sleep(60ULL * 60 * 1000000);  /* 60 minutes */
                 break;
+
+            } else if (ws_error == WS_ERROR_DEVICE_NOT_REGISTERED) {
+                const app_config_t *reg_cfg = config_manager_get_config();
+                registration_error_count++;
+                const char *id = error_info.device_id[0] ? error_info.device_id : reg_cfg->device.id;
+
+                if (registration_error_count < MAX_REGISTRATION_RETRIES) {
+                    display_event_t evt = {};
+                    evt.type = DISPLAY_EVT_STATUS;
+                    snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Connecting...");
+                    snprintf(evt.data.status.line2, sizeof(evt.data.status.line2),
+                             "Attempt %d of %d", registration_error_count, MAX_REGISTRATION_RETRIES - 1);
+                    snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "ID: %.59s", id);
+                    snprintf(evt.data.status.line4, sizeof(evt.data.status.line4), "Checking registration");
+                    xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
+                    vTaskDelay(pdMS_TO_TICKS(30000));  /* 30 seconds between retries */
+                } else {
+                    display_event_t evt = {};
+                    evt.type = DISPLAY_EVT_STATUS;
+                    snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Setup Required");
+                    snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "ID: %.59s", id);
+                    snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "Complete registration");
+                    snprintf(evt.data.status.line4, sizeof(evt.data.status.line4), "then RESTART device");
+                    xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
+
+                    ESP_LOGI(TAG, "Registration failed — entering 10-minute deep sleep");
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    stop_ws_timers();
+                    graceful_shutdown();
+                    power_manager_deep_sleep(10ULL * 60 * 1000000);  /* 10 minutes */
+                    break;
+                }
+
+            } else if (ws_error == WS_ERROR_AUTH_FAILED) {
+                registration_error_count++;
+
+                if (registration_error_count < MAX_REGISTRATION_RETRIES) {
+                    display_event_t evt = {};
+                    evt.type = DISPLAY_EVT_STATUS;
+                    snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Auth Failed");
+                    snprintf(evt.data.status.line2, sizeof(evt.data.status.line2),
+                             "Attempt %d of %d", registration_error_count, MAX_REGISTRATION_RETRIES - 1);
+                    snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "Check auth_token");
+                    snprintf(evt.data.status.line4, sizeof(evt.data.status.line4), "in config.json");
+                    xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
+                    vTaskDelay(pdMS_TO_TICKS(30000));  /* 30 seconds between retries */
+                } else {
+                    display_event_t evt = {};
+                    evt.type = DISPLAY_EVT_STATUS;
+                    snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Auth Failed");
+                    snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "Check auth_token");
+                    snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "in config.json");
+                    snprintf(evt.data.status.line4, sizeof(evt.data.status.line4), "then RESTART device");
+                    xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
+
+                    ESP_LOGI(TAG, "Auth failed — entering 10-minute deep sleep");
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                    stop_ws_timers();
+                    graceful_shutdown();
+                    power_manager_deep_sleep(10ULL * 60 * 1000000);  /* 10 minutes */
+                    break;
+                }
             }
         }
 
-        /* Check for button-triggered pairing request.
+        /* --- Button-triggered pairing (immediate, from button_task ISR) ---
          * Runs here (ws_task, 6KB stack) instead of button_task (4KB) because
          * pairing_manager does TLS HTTP requests requiring ~10-16KB via mbedtls. */
-        if (xEventGroupGetBits(system_events) & EVT_PAIRING_REQUEST) {
-            xEventGroupClearBits(system_events, EVT_PAIRING_REQUEST);
+        if (bits & EVT_PAIRING_REQUEST) {
             ESP_LOGI(TAG, "Button-triggered pairing mode");
+            esp_timer_stop(s_health_timer);
+            esp_timer_stop(s_heartbeat_timer);
             websocket_manager_stop();
 
             xEventGroupClearBits(system_events, EVT_PAIRING_COMPLETE);
             esp_err_t pair_ret = pairing_manager_start(display_queue, system_events);
             if (pair_ret == ESP_OK) {
-                /* New pairing creates a fresh server-side user record without a key.
-                 * Reset the upload flag so the boot sequence re-uploads the public key. */
                 security_manager_reset_key_uploaded();
-
                 ESP_LOGI(TAG, "Pairing complete — restarting to reconnect");
                 vTaskDelay(pdMS_TO_TICKS(100));
                 esp_restart();
@@ -411,20 +494,21 @@ static void ws_task(void *arg)
                 snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Pairing failed");
                 snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "Try again");
                 xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
-                /* Reconnect WebSocket after failed pairing */
                 websocket_manager_start(display_queue);
+                esp_timer_start_periodic(s_health_timer, 30 * 1000000);
+                esp_timer_start_periodic(s_heartbeat_timer, 30 * 1000000);
             }
         }
 
-        /* Check for button-triggered WiFi provisioning request.
+        /* --- Button-triggered WiFi provisioning (immediate, from button_task ISR) ---
          * Stops WebSocket, disconnects WiFi, starts captive portal inline.
          * Matches Arduino: startProvisioning(true) runs inline, no reboot. */
-        if (xEventGroupGetBits(system_events) & EVT_WIFI_PORTAL_REQUEST) {
-            xEventGroupClearBits(system_events, EVT_WIFI_PORTAL_REQUEST);
+        if (bits & EVT_WIFI_PORTAL_REQUEST) {
             ESP_LOGI(TAG, "Button-triggered WiFi provisioning");
+            esp_timer_stop(s_health_timer);
+            esp_timer_stop(s_heartbeat_timer);
             websocket_manager_stop();
 
-            /* Show provisioning screen with QR code */
             display_event_t portal_evt = {};
             portal_evt.type = DISPLAY_EVT_WIFI_PROVISION;
             strncpy(portal_evt.data.wifi_provision.ssid, "pebl-setup",
@@ -433,10 +517,8 @@ static void ws_task(void *arg)
                     sizeof(portal_evt.data.wifi_provision.ip) - 1);
             xQueueSend(display_queue, &portal_evt, pdMS_TO_TICKS(1000));
 
-            /* Disconnect station WiFi so SoftAP can start */
             wifi_manager_disconnect();
 
-            /* Start captive portal — blocks until user submits credentials */
             xEventGroupClearBits(system_events, EVT_WIFI_CONNECTED);
             wifi_manager_start_portal(system_events, EVT_WIFI_CONNECTED);
             xEventGroupWaitBits(system_events, EVT_WIFI_CONNECTED,
@@ -449,90 +531,86 @@ static void ws_task(void *arg)
             break;
         }
 
-        /* Check connection health and act on escalation recommendations.
-         * resilience_manager_check_health() is rate-limited internally (every 5s). */
-        resilience_action_t action = resilience_manager_check_health();
-        switch (action) {
-        case RESILIENCE_ACTION_WIFI_RECONNECT:
-            ESP_LOGW(TAG, "Resilience: forcing WiFi reconnect");
-            resilience_manager_mark_wifi_reconnect();
-            websocket_manager_stop();
-            wifi_manager_reconnect();
-            /* Apply reconnect jitter — mass WiFi outage recovery is a thundering herd scenario */
-            {
-                const app_config_t *rcfg = config_manager_get_config();
-                uint32_t jitter_max_ms = (uint32_t)rcfg->server.reconnect_jitter_max_sec * 1000;
-                uint32_t jitter = device_id_jitter_ms(rcfg->device.id, jitter_max_ms);
-                if (jitter > 0) {
-                    ESP_LOGI(TAG, "Reconnect jitter: %lu ms", (unsigned long)jitter);
-                    vTaskDelay(pdMS_TO_TICKS(jitter));
+        /* --- Connection health check (5s timer) --- */
+        if (bits & EVT_HEALTH_CHECK) {
+            resilience_action_t action = resilience_manager_check_health();
+            switch (action) {
+            case RESILIENCE_ACTION_WIFI_RECONNECT:
+                ESP_LOGW(TAG, "Resilience: forcing WiFi reconnect");
+                resilience_manager_mark_wifi_reconnect();
+                websocket_manager_stop();
+                wifi_manager_reconnect();
+                {
+                    const app_config_t *rcfg = config_manager_get_config();
+                    uint32_t jitter_max_ms = (uint32_t)rcfg->server.reconnect_jitter_max_sec * 1000;
+                    uint32_t jitter = device_id_jitter_ms(rcfg->device.id, jitter_max_ms);
+                    if (jitter > 0) {
+                        ESP_LOGI(TAG, "Reconnect jitter: %lu ms", (unsigned long)jitter);
+                        vTaskDelay(pdMS_TO_TICKS(jitter));
+                    }
+                }
+                websocket_manager_start(display_queue);
+                break;
+
+            case RESILIENCE_ACTION_REBOOT:
+                ESP_LOGW(TAG, "Resilience: entering deep sleep instead of rebooting");
+                stop_ws_timers();
+                graceful_shutdown();
+                power_manager_deep_sleep(60ULL * 60 * 1000000);
+                break;
+
+            case RESILIENCE_ACTION_DEEP_SLEEP:
+                ESP_LOGW(TAG, "Resilience: entering deep sleep after extended downtime");
+                stop_ws_timers();
+                graceful_shutdown();
+                power_manager_deep_sleep(60ULL * 60 * 1000000);
+                break;
+
+            case RESILIENCE_ACTION_NONE:
+            default:
+                break;
+            }
+        }
+
+        /* --- Firmware updates (immediate, from WS callback) --- */
+        if (bits & EVT_WS_FIRMWARE) {
+            if (websocket_manager_has_pending_firmware_required()) {
+                ESP_LOGI(TAG, "Required firmware update — installing now");
+                ota_check_with_display();
+            } else if (websocket_manager_has_pending_firmware_optional()) {
+                int64_t last_reaction = websocket_manager_get_last_reaction_time();
+                int64_t idle_ms = last_reaction > 0 ? (esp_timer_get_time() - last_reaction) / 1000 : INT64_MAX;
+                if (idle_ms > 5 * 60 * 1000) {
+                    ESP_LOGI(TAG, "Optional firmware update — device idle for %lld min",
+                             idle_ms / 60000);
+                    ota_check_with_display();
+                } else {
+                    ESP_LOGI(TAG, "Optional firmware update deferred — device active (%lld s idle)",
+                             idle_ms / 1000);
+                    /* Re-evaluate in 60 seconds. If still not idle, reschedules.
+                     * Stop first in case a previous reeval timer is still pending. */
+                    esp_timer_stop(s_firmware_reeval_timer);
+                    esp_timer_start_once(s_firmware_reeval_timer, 60 * 1000000);
                 }
             }
-            websocket_manager_start(display_queue);
-            break;
-
-        case RESILIENCE_ACTION_REBOOT:
-            /* Deep sleep is safer than rebooting here:
-             * - esp_restart() causes a cold boot where WiFi must reconnect from scratch.
-             *   If WiFi fails on that cold boot, the captive portal activates, disrupting
-             *   a device that was otherwise working (just experiencing transient failures).
-             * - Deep sleep wakes and runs wifi_manager_connect() with the full TX power
-             *   escalation ladder (LOW→MED→HIGH), so it has the best chance to reconnect.
-             * - Both clear runtime state; deep sleep avoids the cold-boot WiFi race. */
-            ESP_LOGW(TAG, "Resilience: entering deep sleep instead of rebooting");
-            graceful_shutdown();
-            power_manager_deep_sleep(60ULL * 60 * 1000000);  /* 60 minutes in microseconds */
-            break;
-
-        case RESILIENCE_ACTION_DEEP_SLEEP:
-            ESP_LOGW(TAG, "Resilience: entering deep sleep after extended downtime");
-            graceful_shutdown();
-            power_manager_deep_sleep(60ULL * 60 * 1000000);  /* 60 minutes in microseconds */
-            break;
-
-        case RESILIENCE_ACTION_NONE:
-        default:
-            break;
         }
 
-        /* Check for server-pushed firmware updates.
-         * Required: install immediately. Optional: install after 5 min idle. */
-        if (websocket_manager_has_pending_firmware_required()) {
-            ESP_LOGI(TAG, "Required firmware update — installing now");
-            ota_check_with_display();
-        } else if (websocket_manager_has_pending_firmware_optional()) {
-            int64_t last_reaction = websocket_manager_get_last_reaction_time();
-            int64_t idle_ms = last_reaction > 0 ? (esp_timer_get_time() - last_reaction) / 1000 : INT64_MAX;
-            if (idle_ms > 5 * 60 * 1000) {
-                ESP_LOGI(TAG, "Optional firmware update — device idle for %lld min",
-                         idle_ms / 60000);
-                ota_check_with_display();
-            } else {
-                ESP_LOGI(TAG, "Optional firmware update deferred — device active (%lld s idle)",
-                         idle_ms / 1000);
-            }
-        }
-
-        /* Periodic OTA check every 24 hours.
-         * Catches updates the server didn't push (e.g., device was offline when
-         * firmware_update message was sent, or server doesn't know about the update).
-         * Skip if a server-pushed optional update is already being deferred — that
-         * block (above) respects the idle-before-install policy. */
-        if (!websocket_manager_has_pending_firmware_optional()) {
-            static int64_t last_ota_check_us = 0;
-            if (last_ota_check_us == 0) {
-                last_ota_check_us = esp_timer_get_time();  // Boot check already ran
-            }
-            const int64_t OTA_CHECK_INTERVAL_US = 24LL * 60 * 60 * 1000000;  // 24 hours
-            if ((esp_timer_get_time() - last_ota_check_us) > OTA_CHECK_INTERVAL_US) {
+        /* --- Periodic OTA check (24h timer, one-shot re-armed) --- */
+        if (bits & EVT_OTA_PERIODIC) {
+            if (!websocket_manager_has_pending_firmware_optional()) {
                 ESP_LOGI(TAG, "24h periodic OTA check");
-                last_ota_check_us = esp_timer_get_time();
                 ota_check_with_display();
             }
+            /* Re-arm for next 24h */
+            esp_timer_start_once(s_ota_timer, 24LL * 60 * 60 * 1000000);
         }
-
-        vTaskDelay(pdMS_TO_TICKS(1000));
     }
+
+    stop_ws_timers();
+    esp_timer_delete(s_health_timer);
+    esp_timer_delete(s_heartbeat_timer);
+    esp_timer_delete(s_ota_timer);
+    esp_timer_delete(s_firmware_reeval_timer);
 
     websocket_manager_stop();
     vTaskDelete(NULL);
@@ -672,6 +750,13 @@ static void display_task(void *arg)
              *         → Show the "Waiting for Reactions" connected screen once
              * Case 3: Normal reconnect with valid content already on screen
              *         → Skip refresh entirely (preserve current display) */
+            /* Power source changed (USB↔battery) — partial refresh the top
+             * status bar only (~300ms). No full re-render or emoji re-download. */
+            if (evt.type == DISPLAY_EVT_POWER_CHANGE) {
+                display_manager_render(&evt);
+                continue;
+            }
+
             if (evt.type == DISPLAY_EVT_CONNECTED) {
                 if (s_rtc_state.showing_connection_lost && s_rtc_state.content_type != DISPLAY_CONTENT_NONE) {
                     /* "Connection Lost" screen replaced the last content — restore it.
@@ -743,7 +828,7 @@ static void display_task(void *arg)
 
 /**
  * Power task: monitors battery voltage, manages sleep transitions.
- * Runs on a 10-second timer interval.
+ * Runs on a 5-minute interval.
  *
  * Low battery (<30%): Top bar shows "LOW BATTERY" automatically via
  * draw_power_status_text() — no full-screen warning needed.
@@ -759,7 +844,18 @@ static void power_task(void *arg)
     ESP_LOGI(TAG, "power_task started");
 
     while (!(xEventGroupGetBits(system_events) & EVT_SHUTDOWN_REQUEST)) {
-        power_manager_check(system_events);
+        bool power_transition = power_manager_check(system_events);
+
+        /* Power source changed (USB↔battery) — partial refresh the top status bar
+         * to update battery indicator and power text (~300ms vs 2s full refresh). */
+        if (power_transition) {
+            ESP_LOGI(TAG, "Power source changed — requesting display update");
+            display_event_t evt = {};
+            evt.type = DISPLAY_EVT_POWER_CHANGE;
+            evt.data.power_change.show_lock = (s_rtc_state.content_type == DISPLAY_CONTENT_REACTION
+                                                && s_rtc_state.reaction.is_encrypted);
+            xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
+        }
 
         /* Critical battery: show warning screen, then deep sleep.
          * power_manager_check() updates voltage/source but no longer sleeps
@@ -776,7 +872,17 @@ static void power_task(void *arg)
             /* Does not return */
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        /* Block for 5 minutes or until shutdown requested.
+         * Battery voltage changes slowly (~1mV/min under light load), so
+         * checking every 5 minutes is sufficient for USB/battery detection
+         * and critical battery shutdown. The cell's own protection circuit
+         * is the real safety net against over-discharge.
+         *
+         * Previous 10-second interval caused unnecessary wakes: 16 ADC
+         * samples × 5ms delay each = 80ms of active time, 8,640 times/day.
+         * At 5-minute intervals this drops to 288 times/day. */
+        xEventGroupWaitBits(system_events, EVT_SHUTDOWN_REQUEST,
+            pdFALSE, pdFALSE, pdMS_TO_TICKS(300000));
     }
 
     vTaskDelete(NULL);
@@ -1126,6 +1232,11 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(display_manager_init(is_deep_sleep_wake || skip_display_refresh));
 
+    /* 5b. Play startup chime on cold boot (no-op on ESP32 / LilyGo T5) */
+    if (!is_deep_sleep_wake) {
+        audio_manager_play_startup();
+    }
+
     /* 6. Initialize security (load or generate ECDH keypair) */
     ESP_ERROR_CHECK(security_manager_init());
 
@@ -1140,6 +1251,9 @@ extern "C" void app_main(void)
 
     /* 9. Initialize power manager (battery ADC, thresholds) */
     ESP_ERROR_CHECK(power_manager_init());
+
+    /* 9b. Initialize notification LED (no-op on ESP32 / LilyGo T5) */
+    ESP_ERROR_CHECK(led_manager_init());
 
     /* 9a. Critical battery check on wake BEFORE WiFi connection.
      * WiFi is the most power-hungry operation — skip it if battery is critically low.

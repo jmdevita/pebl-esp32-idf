@@ -32,10 +32,12 @@ menu "PEBL Display"
 
     config DISPLAY_WIDTH
         int
+        default 122 if DISPLAY_DEPG0213BN || DISPLAY_GDEY0213B74
         default 212
 
     config DISPLAY_HEIGHT
         int
+        default 250 if DISPLAY_DEPG0213BN || DISPLAY_GDEY0213B74
         default 104
 
 endmenu

@@ -27,12 +27,12 @@
 static const char *TAG = "RESILIENCE";
 
 /* Escalation thresholds */
-#define HEARTBEAT_TIMEOUT_MS       45000   /* 45s: 3x the 15s server heartbeat interval, avoids false positives from network jitter */
+#define HEARTBEAT_TIMEOUT_MS       90000   /* 90s: 3x the 30s heartbeat interval, avoids false positives from network jitter */
 #define WIFI_RECONNECT_THRESHOLD   10      /* WS reconnects before forcing WiFi cycle (~10-15 min of WS backoff) */
 #define REBOOT_THRESHOLD           5       /* WiFi reconnects before deep sleep as last resort */
 #define DEEP_SLEEP_DOWNTIME_MS     (30 * 60 * 1000)  /* 30 min total downtime → deep sleep */
 #define HEALTH_LOG_INTERVAL_US     (60 * 1000000LL)   /* Log health status every 60s */
-#define HEALTH_CHECK_INTERVAL_US   (5 * 1000000LL)    /* Rate-limit check_health to every 5s */
+#define HEALTH_CHECK_INTERVAL_US   (30 * 1000000LL)   /* Rate-limit check_health to every 30s */
 
 static struct {
     bool is_healthy;
