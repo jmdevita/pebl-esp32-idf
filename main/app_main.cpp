@@ -1250,6 +1250,34 @@ extern "C" void app_main(void)
     /* 2. Load configuration from LittleFS */
     ESP_ERROR_CHECK(config_manager_init());
 
+    /* 2a. One-time self-heal for early ESP32-S3 (custom PCB) units flashed
+     * with display_variant pinned to a LilyGo string by the original flash.sh.
+     * The OTA system routes by display_variant; serving an ESP32 (Xtensa-LX6)
+     * binary to ESP32-S3 (Xtensa-LX7) hardware bricks the device on reboot.
+     * Rewrite to the correct string and persist. After flash.sh is fixed,
+     * new units arrive with the right string and this becomes a no-op. */
+#if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_DISPLAY_GDEY0213B74
+    {
+        app_config_t *mut_cfg = config_manager_get_mutable_config();
+        if (strncmp(mut_cfg->device.display_variant, "custom_pcb_", 11) != 0) {
+            ESP_LOGW(TAG,
+                     "Self-heal: rewriting display_variant '%s' -> 'custom_pcb_gdey_4g'",
+                     mut_cfg->device.display_variant);
+            strncpy(mut_cfg->device.display_variant, "custom_pcb_gdey_4g",
+                    sizeof(mut_cfg->device.display_variant) - 1);
+            mut_cfg->device.display_variant[sizeof(mut_cfg->device.display_variant) - 1] = '\0';
+            esp_err_t save_err = config_manager_save();
+            if (save_err != ESP_OK) {
+                /* In-memory config is corrected; persist failed. Next boot
+                 * retries the correction. Don't block boot — log and proceed. */
+                ESP_LOGE(TAG, "Self-heal save failed: %s", esp_err_to_name(save_err));
+            } else {
+                ESP_LOGI(TAG, "Self-heal: display_variant persisted to LittleFS");
+            }
+        }
+    }
+#endif
+
     /* 3. Initialize board HAL (pin config, ADC calibration) */
     ESP_ERROR_CHECK(board_init());
 
