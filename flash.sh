@@ -1,6 +1,6 @@
 #!/bin/bash
 # Flash ESP32 firmware and config to a device (ESP-IDF version)
-# Usage: ./flash.sh [--dry-run] [--erase]
+# Usage: ./flash.sh [--dry-run] [--erase] [--flash-config] [--update-config] [--config-only]
 #
 # Equivalent to esp32_arduino_client/flash.sh but uses idf.py instead of PlatformIO.
 # Display variant is compiled in via Kconfig — changing variant requires a rebuild.
@@ -16,7 +16,7 @@ CONFIG_EXAMPLE="$DATA_DIR/config.json.example"
 # Editable defaults — change these for your setup
 # ============================================================================
 DEFAULT_NAME="pebl"
-DEFAULT_ROTATION=1
+DEFAULT_ROTATION=3
 # ============================================================================
 
 # ESP-IDF environment
@@ -26,17 +26,23 @@ IDF_PATH="${IDF_PATH:-$HOME/esp/esp-idf}"
 DRY_RUN=false
 ERASE=false
 FLASH_CONFIG=false
+UPDATE_CONFIG=false
+CONFIG_ONLY=false
 for arg in "$@"; do
     case "$arg" in
-        --dry-run)      DRY_RUN=true ;;
-        --erase)        ERASE=true; FLASH_CONFIG=true ;;
-        --flash-config) FLASH_CONFIG=true ;;
+        --dry-run)        DRY_RUN=true ;;
+        --erase)          ERASE=true; FLASH_CONFIG=true ;;
+        --flash-config)   FLASH_CONFIG=true ;;
+        --update-config)  UPDATE_CONFIG=true ;;
+        --config-only)    CONFIG_ONLY=true; UPDATE_CONFIG=true ;;
         --help|-h)
-            echo "Usage: $0 [--dry-run] [--erase] [--flash-config]"
+            echo "Usage: $0 [--dry-run] [--erase] [--flash-config] [--update-config] [--config-only]"
             echo ""
-            echo "  --dry-run       Preview config without flashing"
-            echo "  --erase         Erase entire flash before programming (includes config)"
-            echo "  --flash-config  Overwrite the LittleFS config partition (loses pairing/auth)"
+            echo "  --dry-run        Preview config without flashing"
+            echo "  --erase          Erase entire flash before programming (includes config)"
+            echo "  --flash-config   Overwrite the LittleFS config partition (loses pairing/auth)"
+            echo "  --update-config  Read device config, merge changes, flash back (preserves auth)"
+            echo "  --config-only    Same as --update-config but skip firmware build/flash"
             exit 0
             ;;
     esac
@@ -54,6 +60,14 @@ info()    { echo -e "${CYAN}[INFO]${NC} $1"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 success() { echo -e "${GREEN}[OK]${NC} $1"; }
+
+# --update-config and --flash-config are mutually exclusive
+if $UPDATE_CONFIG && $FLASH_CONFIG; then
+    error "--update-config and --flash-config are mutually exclusive"
+    error "--update-config merges into existing config (preserves auth)"
+    error "--flash-config overwrites with a fresh config (loses auth)"
+    exit 1
+fi
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════╗${NC}"
@@ -224,12 +238,16 @@ NEEDS_REBUILD=false
 if [ -f "$SDKCONFIG" ]; then
     if ! grep -q "${DISPLAY_KCONFIG}=y" "$SDKCONFIG"; then
         NEEDS_REBUILD=true
-        warn "Display variant changed — firmware will be rebuilt"
+        if ! $CONFIG_ONLY; then
+            warn "Display variant changed — firmware will be rebuilt"
+        fi
     fi
     # Check if SPI pins changed (board switch)
     if ! grep -q "CONFIG_EINK_SPI_MOSI=${SPI_MOSI}$" "$SDKCONFIG"; then
         NEEDS_REBUILD=true
-        warn "Board SPI pins changed — firmware will be rebuilt"
+        if ! $CONFIG_ONLY; then
+            warn "Board SPI pins changed — firmware will be rebuilt"
+        fi
     fi
 else
     NEEDS_REBUILD=true
@@ -267,13 +285,17 @@ printf "${BOLD}│${NC}  %-14s ${YELLOW}%-22s${NC}${BOLD}│${NC}\n" "Rebuild:" 
 fi
 if $FLASH_CONFIG; then
 printf "${BOLD}│${NC}  %-14s ${YELLOW}%-22s${NC}${BOLD}│${NC}\n" "Config:" "OVERWRITE (loses auth)"
+elif $UPDATE_CONFIG; then
+printf "${BOLD}│${NC}  %-14s ${GREEN}%-22s${NC}${BOLD}│${NC}\n" "Config:" "MERGE (preserves auth)"
 else
 printf "${BOLD}│${NC}  %-14s %-22s${BOLD}│${NC}\n" "Config:" "preserve on-device"
 fi
 if $ERASE; then
 printf "${BOLD}│${NC}  %-14s ${RED}%-22s${NC}${BOLD}│${NC}\n" "Erase:" "FULL FLASH WIPE"
 fi
-if $DRY_RUN; then
+if $CONFIG_ONLY; then
+printf "${BOLD}│${NC}  %-14s ${CYAN}%-22s${NC}${BOLD}│${NC}\n" "Mode:" "CONFIG ONLY (no build)"
+elif $DRY_RUN; then
 printf "${BOLD}│${NC}  %-14s ${YELLOW}%-22s${NC}${BOLD}│${NC}\n" "Mode:" "DRY RUN"
 fi
 echo -e "${BOLD}└──────────────────────────────────────┘${NC}"
@@ -313,7 +335,7 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
 fi
 
 # --- Update Kconfig if variant or board changed ---
-if $NEEDS_REBUILD; then
+if $NEEDS_REBUILD && ! $CONFIG_ONLY; then
     echo ""
     info "Setting display variant to $DISPLAY_VARIANT in sdkconfig..."
 
@@ -345,11 +367,15 @@ if $NEEDS_REBUILD; then
 fi
 
 # --- Build firmware ---
-echo ""
-info "Building firmware..."
-cd "$SCRIPT_DIR"
-idf.py build
-success "Firmware built"
+if $CONFIG_ONLY; then
+    info "Skipping firmware build (--config-only)"
+else
+    echo ""
+    info "Building firmware..."
+    cd "$SCRIPT_DIR"
+    idf.py build
+    success "Firmware built"
+fi
 
 # --- Erase flash (if requested) ---
 if $ERASE; then
@@ -359,11 +385,115 @@ if $ERASE; then
     success "Flash erased"
 fi
 
+# --- Update config by reading device, merging changes, and flashing back ---
+# This preserves auth_token, WiFi credentials, and all other on-device state
+# while allowing changes to rotation, name, variant, etc.
+if $UPDATE_CONFIG; then
+    echo ""
+    info "Reading current config from device..."
+
+    LITTLEFS_IMG="$SCRIPT_DIR/build/littlefs.bin"
+    PARTITION_SIZE=$((0x10000))
+
+    # Read the current LittleFS partition from the device
+    DEVICE_IMG="$SCRIPT_DIR/build/littlefs_device.bin"
+    # Use conservative baud rate for read_flash — higher rates (460800) cause
+    # "Invalid head of packet" errors on some ESP32/USB-UART combinations
+    esptool.py --port "$PORT" --baud 115200 read_flash 0x3F0000 $PARTITION_SIZE "$DEVICE_IMG"
+    success "Read LittleFS partition from device"
+
+    # Ensure littlefs-python is available
+    if ! python3 -c "import littlefs" 2>/dev/null; then
+        warn "Installing littlefs-python..."
+        pip3 install littlefs-python
+    fi
+
+    # Extract config.json, merge changes, write new image
+    python3 -c "
+import littlefs, json, os
+
+block_size = 4096
+block_count = $PARTITION_SIZE // block_size
+
+# Mount the device image to read existing config
+with open('$DEVICE_IMG', 'rb') as f:
+    device_data = f.read()
+
+fs = littlefs.LittleFS(block_size=block_size, block_count=block_count, mount=False)
+fs.context.buffer = bytearray(device_data)
+fs.mount()
+
+try:
+    with fs.open('/config.json', 'r') as f:
+        device_config = json.loads(f.read())
+    print('  Found on-device config.json')
+except Exception as e:
+    print(f'  ERROR: Could not read config.json from device: {e}')
+    exit(1)
+
+fs.unmount()
+
+# Show what we're preserving
+auth = device_config.get('security', {}).get('auth_token', '')
+if auth:
+    print(f'  Preserving auth_token: {auth[:8]}...')
+else:
+    print('  No auth_token on device (not yet paired)')
+
+wifi_nets = device_config.get('wifi', {}).get('seed_networks', [])
+if wifi_nets:
+    ssids = [n.get('ssid', '?') for n in wifi_nets]
+    print('  Preserving WiFi networks: ' + ', '.join(ssids))
+
+# Merge in the requested changes
+device_config['device']['name'] = '$DEVICE_NAME'
+device_config['device']['display_variant'] = '$DISPLAY_VARIANT_CONFIG'
+device_config['display']['rotation'] = $DISPLAY_ROTATION
+
+# Also merge any seed_networks from local config.json that aren't on-device
+# (allows adding new WiFi networks without losing existing ones)
+try:
+    with open('$CONFIG_FILE', 'r') as f:
+        local_config = json.load(f)
+    local_nets = local_config.get('wifi', {}).get('seed_networks', [])
+    device_ssids = {n.get('ssid') for n in wifi_nets}
+    for net in local_nets:
+        if net.get('ssid') and net['ssid'] not in device_ssids:
+            device_config.setdefault('wifi', {}).setdefault('seed_networks', []).append(net)
+            print(f'  Adding new WiFi network: {net[\"ssid\"]}')
+except Exception:
+    pass  # Local config read failure is non-fatal
+
+print()
+print('  Merged config:')
+print(json.dumps(device_config, indent=2))
+print()
+
+# Create new LittleFS image with merged config
+fs2 = littlefs.LittleFS(block_size=block_size, block_count=block_count)
+with fs2.open('/config.json', 'w') as f:
+    f.write(json.dumps(device_config, indent=2) + '\n')
+
+img = bytes(fs2.context.buffer)
+with open('$LITTLEFS_IMG', 'wb') as f:
+    f.write(img)
+print(f'  LittleFS image: {len(img)} bytes')
+"
+
+    success "Config merged"
+
+    info "Flashing merged config to device..."
+    esptool.py --port "$PORT" --baud 460800 write_flash 0x3F0000 "$LITTLEFS_IMG"
+    success "Config partition updated (auth and keys preserved)"
+
+    # Clean up device image
+    rm -f "$DEVICE_IMG"
+
 # --- Create and flash LittleFS image with config.json ---
 # Only flash the config partition on first flash, --erase, or --flash-config.
 # Normal firmware updates preserve the on-device config (which contains the
 # auth_token saved during pairing, WiFi credentials learned via captive portal, etc.).
-if $FLASH_CONFIG; then
+elif $FLASH_CONFIG; then
     echo ""
     info "Creating LittleFS image with config.json..."
     warn "This will overwrite on-device config (auth token, pairing state, etc.)"
@@ -444,10 +574,14 @@ else
 fi
 
 # --- Flash firmware ---
-echo ""
-info "Flashing firmware..."
-idf.py -p "$PORT" flash
-success "Firmware flashed"
+if $CONFIG_ONLY; then
+    info "Skipping firmware flash (--config-only)"
+else
+    echo ""
+    info "Flashing firmware..."
+    idf.py -p "$PORT" flash
+    success "Firmware flashed"
+fi
 
 # --- Done ---
 echo ""

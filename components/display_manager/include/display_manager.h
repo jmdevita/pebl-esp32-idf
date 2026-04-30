@@ -130,6 +130,28 @@ uint16_t display_manager_get_width(void);
  */
 uint16_t display_manager_get_height(void);
 
+/**
+ * Returns true if dot animation is active (boot connecting or connection lost).
+ * Used by display_task to shorten its queue timeout for animation frames.
+ */
+bool display_manager_is_dot_animating(void);
+
+/**
+ * Advance the dot animation by one frame via partial refresh (~300ms).
+ * Cycles: ● → ● ● → ● ● ● → ● → ...
+ * No-op if animation is not active.
+ */
+void display_manager_animate_dots(void);
+
+/**
+ * Send the e-paper controller into deep sleep.
+ * Call before host MCU deep sleep to lower panel standby current
+ * (matches the GxEPD2 hibernate() pattern). Must only be called when
+ * no render is in flight — caller is responsible for queue drainage.
+ * Subsequent renders auto-recover via the driver's _wakeUp() reset.
+ */
+void display_manager_hibernate(void);
+
 #ifdef __cplusplus
 }
 #endif

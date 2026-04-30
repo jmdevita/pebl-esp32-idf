@@ -81,6 +81,17 @@ static bool s_initialized = false;
 #define DISPLAY_WIDTH   CONFIG_DISPLAY_WIDTH
 #define DISPLAY_HEIGHT  CONFIG_DISPLAY_HEIGHT
 
+/* Invisible pixel inset at the bottom edge in landscape mode.
+ * GDEY0213B74/DEPG0213BN have a 128-pixel buffer but only 122 visible pixels
+ * on the short axis. In landscape rotation, these 6 invisible pixels appear
+ * at the bottom of the screen, causing content placed near display.height()
+ * to be clipped off-screen. */
+#if defined(CONFIG_DISPLAY_GDEY0213B74) || defined(CONFIG_DISPLAY_DEPG0213BN)
+#define SCREEN_BOTTOM_INSET 6
+#else
+#define SCREEN_BOTTOM_INSET 0
+#endif
+
 /* Grayscale color constants for 4-level e-paper rendering.
  * These match CalEPD's gdew_4grays.h values and map to the SSD1680's
  * dual-RAM-plane encoding: each pixel uses 1 bit in each plane,
@@ -238,6 +249,11 @@ static void enable_grayscale(void)
  */
 static void draw_battery_indicator(void)
 {
+    /* Hide indicator entirely on boards without battery sense hardware
+     * (custom PCB v1.1 — floating ADC). A misleading "0%" indicator is worse
+     * than no indicator at all. USB icon / source detection still works. */
+    if (!power_manager_has_valid_battery_reading()) return;
+
     uint8_t percent = power_manager_get_battery_percent();
     int level;
     if (percent < 25) level = 0;
@@ -275,11 +291,17 @@ static void draw_power_status_text(void)
         return;
     }
 
-    uint8_t percent = power_manager_get_battery_percent();
+    /* Without valid battery readings the % is meaningless — show plain
+     * "BATTERY" instead of urgency labels that would be guesses. */
     const char *text;
-    if (percent < 5)       text = "CHARGE NOW";
-    else if (percent < 30) text = "LOW BATTERY";
-    else                   text = "BATTERY";
+    if (!power_manager_has_valid_battery_reading()) {
+        text = "BATTERY";
+    } else {
+        uint8_t percent = power_manager_get_battery_percent();
+        if (percent < 5)       text = "CHARGE NOW";
+        else if (percent < 30) text = "LOW BATTERY";
+        else                   text = "BATTERY";
+    }
 
     display.setFont(NULL);  /* Built-in 5x7 font */
     int16_t x1, y1;
@@ -519,7 +541,7 @@ static void render_reaction(const reaction_data_t *reaction)
         strncpy(plat, reaction->platform, sizeof(plat) - 1);
         plat[sizeof(plat) - 1] = '\0';
         plat[0] = (char)toupper((unsigned char)plat[0]);
-        display.setCursor(10, display.height() - 14);
+        display.setCursor(10, display.height() - SCREEN_BOTTOM_INSET - 14);
         display.print(plat);
     }
 
@@ -675,7 +697,7 @@ static void render_broadcast(const display_event_t *evt)
         strncpy(plat, b->platform, sizeof(plat) - 1);
         plat[sizeof(plat) - 1] = '\0';
         plat[0] = (char)toupper((unsigned char)plat[0]);
-        display.setCursor(10, display.height() - 14);
+        display.setCursor(10, display.height() - SCREEN_BOTTOM_INSET - 14);
         display.print(plat);
     }
 
@@ -836,47 +858,103 @@ static void render_splash(void)
     int16_t vx, vy;
     uint16_t vw, vh;
     display.getTextBounds(version, 0, 0, &vx, &vy, &vw, &vh);
-    display.setCursor(display.width() - vw - 5, display.height() - 5);
+    display.setCursor(display.width() - vw - 5, display.height() - SCREEN_BOTTOM_INSET - 5);
     display.print(version);
 
     display.update();
 }
 
+/* Dot animation state (disconnected screen).
+ * Region coordinates stored during full render, reused by partial refresh. */
+static bool s_dot_animating = false;
+static uint8_t s_dot_count = 0;
+static int16_t s_dot_cx = 0;     /* center X of dot row */
+static int16_t s_dot_cy = 0;     /* center Y of dot row */
+static int16_t s_dot_region_y = 0; /* top of partial refresh region */
+
+/* Card and dot layout constants */
+static const int16_t CARD_PAD_X = 16;     /* horizontal padding inside card */
+static const int16_t CARD_PAD_Y = 12;     /* vertical padding inside card */
+static const int16_t CARD_R = 6;          /* corner radius */
+static const int16_t DOT_RADIUS = 3;
+static const int16_t DOT_SPACING = 14;    /* center-to-center */
+static const int16_t DOT_REGION_H = 16;   /* partial refresh height for dots */
+
 /**
- * Render boot status: "Connecting to Server..." centered, device name below.
- * Battery indicator in top-right (no power status text — clean boot look).
- * Matches Arduino DisplayManager::showBootStatus().
+ * Render boot status: card layout with "Connecting to Server" centered.
+ * Battery indicator in top-right. No dot animation here — the boot-to-connected
+ * transition is typically ~2-3s, too fast for dots and the partial→full refresh
+ * transition causes visible artifacts.
  */
-static void render_boot_status(const char *device_name)
+static void render_boot_status(const char * /* device_name */)
 {
-    ESP_LOGI(TAG, "Rendering boot status (device: %s)", device_name);
+    ESP_LOGI(TAG, "Rendering boot status");
+
+    int16_t visible_h = display.height() - SCREEN_BOTTOM_INSET;
 
     display.fillScreen(COLOR_WHITE);
     display.setTextColor(COLOR_BLACK);
 
     draw_battery_indicator();
 
-    /* "Connecting to Server..." — centered horizontally and vertically */
-    set_font(FONT_SANS_9PT);
+    /* Measure text first so the card auto-sizes around it with consistent padding,
+     * preventing the text from clipping or touching the rounded border. */
+    set_font(FONT_SANS_BOLD_9PT);
     const char *msg = "Connecting to Server...";
     int16_t tx, ty;
     uint16_t tw, th;
     display.getTextBounds(msg, 0, 0, &tx, &ty, &tw, &th);
-    int16_t cx = (display.width() - (int16_t)tw) / 2;
-    int16_t cy = (display.height() - (int16_t)th) / 2 - ty;
-    display.setCursor(cx, cy);
+
+    int16_t card_w = (int16_t)tw + CARD_PAD_X * 2;
+    int16_t card_h = (int16_t)th + CARD_PAD_Y * 2;
+    int16_t card_x = (display.width() - card_w) / 2;
+    int16_t card_y = (visible_h - card_h) / 2;
+    display.fillRoundRect(card_x, card_y, card_w, card_h, CARD_R, COLOR_WHITE);
+    display.drawRoundRect(card_x, card_y, card_w, card_h, CARD_R, COLOR_BLACK);
+
+    /* Center text within the card (getTextBounds returns offset tx/ty relative to baseline). */
+    int16_t text_x = card_x + (card_w - (int16_t)tw) / 2 - tx;
+    int16_t text_y = card_y + (card_h - (int16_t)th) / 2 - ty;
+    display.setCursor(text_x, text_y);
     display.print(msg);
 
-    /* Device name centered below */
-    if (device_name && device_name[0] != '\0') {
-        int16_t nx, ny;
-        uint16_t nw, nh;
-        display.getTextBounds(device_name, 0, 0, &nx, &ny, &nw, &nh);
-        display.setCursor((display.width() - (int16_t)nw) / 2, cy + (int16_t)th + 8);
-        display.print(device_name);
+    display.update();
+}
+
+/**
+ * Animate dots via partial refresh (~300ms).
+ * Cycles: ● → ● ● → ● ● ● → ● → ...
+ * Called from display_task on a timer while waiting for connection.
+ */
+static void animate_dots(void)
+{
+    if (!s_dot_animating) return;
+
+    s_dot_count = (s_dot_count % 3) + 1;
+
+    board_acquire_wake_lock();
+    display.setMonoMode(true);
+
+    /* Clear dot region */
+    int16_t region_x = s_dot_cx - DOT_SPACING - DOT_RADIUS - 2;
+    int16_t region_w = DOT_SPACING * 2 + DOT_RADIUS * 2 + 4;
+    display.fillRect(region_x, s_dot_region_y, region_w, DOT_REGION_H, EPD_WHITE);
+
+    /* Draw dots centered: 1 dot at center, 2 dots spread, 3 dots spread */
+    if (s_dot_count == 1) {
+        display.fillCircle(s_dot_cx, s_dot_cy, DOT_RADIUS, EPD_BLACK);
+    } else if (s_dot_count == 2) {
+        display.fillCircle(s_dot_cx - DOT_SPACING / 2, s_dot_cy, DOT_RADIUS, EPD_BLACK);
+        display.fillCircle(s_dot_cx + DOT_SPACING / 2, s_dot_cy, DOT_RADIUS, EPD_BLACK);
+    } else {
+        display.fillCircle(s_dot_cx - DOT_SPACING, s_dot_cy, DOT_RADIUS, EPD_BLACK);
+        display.fillCircle(s_dot_cx, s_dot_cy, DOT_RADIUS, EPD_BLACK);
+        display.fillCircle(s_dot_cx + DOT_SPACING, s_dot_cy, DOT_RADIUS, EPD_BLACK);
     }
 
-    display.update();
+    display.updateWindow(region_x, s_dot_region_y, region_w, DOT_REGION_H);
+    display.setMonoMode(false);
+    board_release_wake_lock();
 }
 
 /**
@@ -948,15 +1026,17 @@ static void render_connected(bool show_lock)
  */
 static void render_disconnected(const char *subtitle)
 {
-    const char *sub = (subtitle && subtitle[0] != '\0') ? subtitle : "Check WiFi/Server";
+    const char *sub = (subtitle && subtitle[0] != '\0') ? subtitle : "Reconnecting";
     ESP_LOGI(TAG, "Rendering disconnected screen: %s", sub);
+
+    int16_t visible_h = display.height() - SCREEN_BOTTOM_INSET;
 
     display.fillScreen(COLOR_WHITE);
     display.setTextColor(COLOR_BLACK);
 
     draw_battery_indicator();
 
-    /* Measure text for vertical centering */
+    /* Measure text for vertical centering (including dot area) */
     set_font(FONT_SANS_BOLD_9PT);
     int16_t c1x, c1y;
     uint16_t c1w, c1h;
@@ -970,8 +1050,10 @@ static void render_disconnected(const char *subtitle)
     const int16_t iconSize = 20;
     const int16_t gap1 = 10;
     const int16_t gap2 = 6;
-    int16_t totalHeight = iconSize + gap1 + (int16_t)c1h + gap2 + (int16_t)c2h;
-    int16_t startY = (display.height() - totalHeight) / 2;
+    const int16_t dotGap = 20;  /* gap from subtitle baseline to dot center */
+    int16_t totalHeight = iconSize + gap1 + (int16_t)c1h + gap2 + (int16_t)c2h
+                        + dotGap + DOT_RADIUS * 2;
+    int16_t startY = (visible_h - totalHeight) / 2;
     int16_t centerX = display.width() / 2;
 
     /* Draw thick X icon (16px, 3px line thickness) */
@@ -992,10 +1074,21 @@ static void render_disconnected(const char *subtitle)
     /* Subtitle regular, centered below */
     int16_t subY = textY + (int16_t)c1h + gap2;
     set_font(FONT_SANS_9PT);
-    display.setCursor(centerX - (int16_t)c2w / 2, subY + (int16_t)c2h);
+    int16_t subBaseline = subY + (int16_t)c2h;
+    display.setCursor(centerX - (int16_t)c2w / 2, subBaseline);
     display.print(sub);
 
+    /* Store dot region for partial refresh animation */
+    s_dot_cx = centerX;
+    s_dot_cy = subBaseline + dotGap;
+    s_dot_region_y = s_dot_cy - DOT_RADIUS - 2;
+
+    /* Draw first dot */
+    s_dot_count = 1;
+    display.fillCircle(s_dot_cx, s_dot_cy, DOT_RADIUS, COLOR_BLACK);
+
     display.update();
+    s_dot_animating = true;
 }
 
 /**
@@ -1115,8 +1208,8 @@ static void render_low_battery(void)
 
     /* Instructions — FreeSans9pt, centered, 25px below */
     set_font(FONT_SANS_9PT);
-    const char *line2 = "Charge, then press";
-    const char *line3 = "button to restart";
+    const char *line2 = "Charge, then toggle";
+    const char *line3 = "switch off and on";
     int16_t x2, y2;
     uint16_t w2, h2;
     display.getTextBounds(line2, 0, 0, &x2, &y2, &w2, &h2);
@@ -1397,6 +1490,9 @@ static void render_power_change(bool show_lock)
 
 void display_manager_render(display_event_t *evt)
 {
+    /* Stop boot dot animation when any new screen renders */
+    s_dot_animating = false;
+
     /* Acquire PM lock to prevent light sleep during SPI e-paper refresh.
      * E-paper controllers require uninterrupted SPI communication during
      * the 2-4 second refresh cycle — sleeping mid-transaction corrupts
@@ -1473,6 +1569,13 @@ void display_manager_render(display_event_t *evt)
     }
 }
 
+void display_manager_hibernate(void)
+{
+    if (!s_initialized) return;
+    ESP_LOGI(TAG, "Hibernating e-paper controller");
+    display.hibernate();
+}
+
 uint16_t display_manager_get_width(void)
 {
     return DISPLAY_WIDTH;
@@ -1481,4 +1584,14 @@ uint16_t display_manager_get_width(void)
 uint16_t display_manager_get_height(void)
 {
     return DISPLAY_HEIGHT;
+}
+
+bool display_manager_is_dot_animating(void)
+{
+    return s_dot_animating;
+}
+
+void display_manager_animate_dots(void)
+{
+    animate_dots();
 }

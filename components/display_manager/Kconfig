@@ -30,6 +30,18 @@ menu "PEBL Display"
 
     endchoice
 
+    config GDEY0213B74_FAST_GRAY_LUT
+        bool "GDEY0213B74: use shortened 4-gray LUT (fewer flashes)"
+        depends on DISPLAY_GDEY0213B74
+        default y
+        help
+            Replace the stock Good Display 4-gray LUT with a shortened variant
+            that cuts phase-1 repetitions from 4 to 2. Reduces full-screen
+            grayscale refresh from ~5.2s (5 flashes) to ~3.5s (3 flashes).
+            Voltages and VS waveforms are unchanged — only timing differs.
+            Disable this if grayscale quality degrades or ghosting accumulates
+            on a particular panel.
+
     config DISPLAY_WIDTH
         int
         default 122 if DISPLAY_DEPG0213BN || DISPLAY_GDEY0213B74

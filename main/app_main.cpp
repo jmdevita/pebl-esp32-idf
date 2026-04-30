@@ -118,6 +118,7 @@ static SemaphoreHandle_t button_semaphore = NULL;
 #define EVT_HEALTH_CHECK        BIT8   /* esp_timer: run resilience check (30s periodic) */
 #define EVT_HEARTBEAT_DUE       BIT9   /* esp_timer: send heartbeat + check timeout (30s periodic) */
 #define EVT_OTA_PERIODIC        BIT10  /* esp_timer: 24h OTA check (one-shot, re-armed) */
+#define EVT_DISPLAY_IDLE        BIT11  /* display_task is blocked on queue (no render in flight) */
 
 /* Display queue depth: buffer a few reactions while display is refreshing */
 #define DISPLAY_QUEUE_DEPTH  4
@@ -130,6 +131,29 @@ static SemaphoreHandle_t button_semaphore = NULL;
 
 /* Forward declaration — defined before app_main(), used by ws_task and power_task */
 static void graceful_shutdown(void);
+
+/**
+ * Block until display_task has drained the queue and the in-flight render
+ * (if any) has completed. Required before host deep sleep so we don't
+ * interrupt an SPI refresh mid-transfer (leaves the panel in an
+ * indeterminate state — symptom: black screen after sleep).
+ *
+ * Returns true if idle within `timeout_ms`, false on timeout.
+ */
+static bool wait_for_display_idle(uint32_t timeout_ms)
+{
+    if (!display_queue || !system_events) return true;
+    const TickType_t poll = pdMS_TO_TICKS(100);
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (xTaskGetTickCount() < deadline) {
+        EventBits_t bits = xEventGroupGetBits(system_events);
+        if ((bits & EVT_DISPLAY_IDLE) && uxQueueMessagesWaiting(display_queue) == 0) {
+            return true;
+        }
+        vTaskDelay(poll);
+    }
+    return false;
+}
 
 /* ---------- esp_timer handles for event-driven ws_task ----------
  * All callbacks run in the esp_timer task context (CONFIG_ESP_TIMER_ISR_DISPATCH
@@ -399,8 +423,14 @@ static void ws_task(void *arg)
                     xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
                 }
 
-                ESP_LOGI(TAG, "Trial expired — entering 60-minute deep sleep");
-                vTaskDelay(pdMS_TO_TICKS(2000));
+                ESP_LOGI(TAG, "Trial expired — waiting for QR render before deep sleep");
+                /* Block until the QR (and any prior in-flight render) is
+                 * fully on the panel. A 4-gray full refresh after a B&W
+                 * pre-clear can take ~10s on UC8151D, so allow generous
+                 * headroom — the wait returns as soon as truly idle. */
+                if (!wait_for_display_idle(30000)) {
+                    ESP_LOGW(TAG, "Display did not go idle within 30s — sleeping anyway");
+                }
                 stop_ws_timers();
                 graceful_shutdown();
                 power_manager_deep_sleep(60ULL * 60 * 1000000);  /* 60 minutes */
@@ -738,8 +768,19 @@ static void display_task(void *arg)
     display_event_t evt;
 
     while (!(xEventGroupGetBits(system_events) & EVT_SHUTDOWN_REQUEST)) {
-        /* Use finite timeout so we periodically check for shutdown */
-        if (xQueueReceive(display_queue, &evt, pdMS_TO_TICKS(TASK_SHUTDOWN_CHECK_MS)) == pdTRUE) {
+        /* Shorter timeout during dot animation (boot/disconnected) for updates
+         * (~800ms per frame). Otherwise use the normal shutdown-check interval. */
+        TickType_t timeout = display_manager_is_dot_animating()
+            ? pdMS_TO_TICKS(800)
+            : pdMS_TO_TICKS(TASK_SHUTDOWN_CHECK_MS);
+
+        /* Signal idle while blocked on the queue. Cleared as soon as an event
+         * is received (before the render starts), so wait_for_display_idle()
+         * never sees a transient idle window between two queued events. */
+        xEventGroupSetBits(system_events, EVT_DISPLAY_IDLE);
+
+        if (xQueueReceive(display_queue, &evt, timeout) == pdTRUE) {
+            xEventGroupClearBits(system_events, EVT_DISPLAY_IDLE);
             /* Three-way logic for CONNECTED events to suppress redundant e-paper refreshes.
              * On light sleep reconnects (~5-10 min), the screen content hasn't changed,
              * so refreshing wastes 2-4s of battery and causes visible flicker.
@@ -820,6 +861,9 @@ static void display_task(void *arg)
             } else if (evt.type == DISPLAY_EVT_DISCONNECTED) {
                 s_rtc_state.showing_connection_lost = true;
             }
+        } else if (display_manager_is_dot_animating()) {
+            /* Queue timed out — advance dot animation via partial refresh */
+            display_manager_animate_dots();
         }
     }
 
@@ -1028,18 +1072,29 @@ static esp_err_t init_nvs(void)
  * Called after WiFi connects. When all FreeRTOS tasks block,
  * the CPU enters light sleep automatically. WiFi radio wakes on
  * DTIM beacons to check for buffered frames.
+ *
+ * ESP32-S3 with native USB Serial/JTAG: light sleep powers down the CPU,
+ * which kills the USB controller and causes a bus reset → chip reboot.
+ * When USB is connected, skip light sleep (no power saving needed on USB).
+ * Battery operation still gets full light sleep benefits (~1-3mA).
  */
 static void enable_light_sleep(void)
 {
-    /* ESP-IDF v5.x unified PM config type (replaces target-specific types) */
+    bool on_usb = (power_manager_get_source() == POWER_SOURCE_USB);
+
     esp_pm_config_t pm_config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz = 80,
-        .light_sleep_enable = true
+        .light_sleep_enable = !on_usb
     };
     ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
-    ESP_LOGI(TAG, "Auto light sleep enabled with WiFi DTIM power save");
+
+    if (on_usb) {
+        ESP_LOGI(TAG, "USB connected — light sleep disabled (WiFi power save still active)");
+    } else {
+        ESP_LOGI(TAG, "Auto light sleep enabled with WiFi DTIM power save");
+    }
 }
 
 /**
@@ -1105,6 +1160,17 @@ static void graceful_shutdown(void)
 
     websocket_manager_stop();
     wifi_manager_disconnect();
+
+    /* Drain any in-flight display render before hibernating the panel.
+     * Hibernating mid-refresh would corrupt the frame buffer (symptom:
+     * black screen after wake). Caller paths typically already wait via
+     * wait_for_display_idle(), so this is normally a no-op. */
+    wait_for_display_idle(15000);
+
+    /* Park the e-paper controller in its own deep sleep before the host MCU
+     * powers down. Lowers panel standby current and matches GxEPD2's
+     * hibernate() pattern. */
+    display_manager_hibernate();
 
     /* Brief delay for log flush before deep sleep halts UART */
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -1262,7 +1328,8 @@ extern "C" void app_main(void)
      * require battery to reach BATTERY_RECOVERY_MV (~20%) before allowing boot.
      * This prevents oscillation where voltage sag under WiFi load drops below 15%,
      * device sleeps, voltage recovers to 16%, device boots, WiFi drops it again. */
-    if (is_deep_sleep_wake && power_manager_get_source() == POWER_SOURCE_BATTERY) {
+    if (is_deep_sleep_wake && power_manager_get_source() == POWER_SOURCE_BATTERY
+        && power_manager_has_valid_battery_reading()) {
         int threshold = s_rtc_state.was_critical_battery
             ? BATTERY_RECOVERY_MV    // Previously critical: require ~20% to exit
             : BATTERY_CRITICAL_MV;   // Normal wake: 15% entry threshold

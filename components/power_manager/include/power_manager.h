@@ -24,6 +24,18 @@ extern "C" {
 #define BATTERY_NO_BATTERY_MAX  5500    /* Above = no battery detected */
 
 /**
+ * Sanity floor for "is the ADC actually wired to a battery divider?"
+ * Any LiPo cell that can power the ESP32 must read above ~3000 mV after the
+ * 2× divider compensation. A floating ADC pin (custom PCB v1.1 has no battery
+ * sense circuit) reads junk values typically below 500 mV. The 1500 mV floor
+ * is well above any floating-pin reading and well below any real battery
+ * capable of powering the chip — so a reading below this means the board has
+ * no battery sense hardware. Used on ESP32-S3 only; the LilyGo T5 (ESP32) has
+ * a real divider and skips this check entirely.
+ */
+#define BATTERY_SENSE_FLOOR_MV  1500
+
+/**
  * Voltage divider ratio for LilyGo T5 battery measurement.
  * The ADC reads through a resistor divider, so actual voltage = ADC reading * ratio.
  */
@@ -98,8 +110,21 @@ power_source_t power_manager_get_source(void);
 /**
  * Check if battery is at critical level (below BATTERY_CRITICAL_MV).
  * Caller should show a warning screen and then call power_manager_deep_sleep().
+ * Always returns false when battery sense is unavailable (see
+ * power_manager_has_valid_battery_reading()).
  */
 bool power_manager_is_critical_battery(void);
+
+/**
+ * Returns true if the board has working battery voltage sense hardware.
+ * On ESP32-S3 with the custom PCB v1.1 there is no battery divider, so the
+ * ADC reads a floating pin — this returns false. On ESP32 (LilyGo T5) and on
+ * future S3 revisions with a divider or fuel gauge, this returns true.
+ *
+ * When false, callers should hide battery indicators, skip critical-battery
+ * shutdowns, and avoid showing percentage-based labels.
+ */
+bool power_manager_has_valid_battery_reading(void);
 
 /**
  * Enter deep sleep with configured wake sources.

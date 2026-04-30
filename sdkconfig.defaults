@@ -7,15 +7,31 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 CONFIG_ESP_WIFI_SLP_IRAM_OPT=y
 CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME=50
 CONFIG_ESP_WIFI_SLP_DEFAULT_MAX_ACTIVE_TIME=60
+# When a beacon is missed (interference, router busy), the default behavior
+# wakes to full power and aggressively scans. This optimization uses gentler
+# recovery with fewer wakes and less TX power during beacon loss events.
+CONFIG_ESP_WIFI_SLP_BEACON_LOST_OPT=y
 
 # --- WiFi ---
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+
+# --- lwIP (IPv6 disabled — saves ~0.2-0.5mA) ---
+# IPv6 adds MLD6 multicast reports every 40s + neighbor discovery traffic,
+# each waking the WiFi radio. Our server connects over IPv4 only.
+CONFIG_LWIP_IPV6=n
 
 # --- lwIP (light sleep optimization) ---
 # Default is 1 second, which wakes the CPU from light sleep every second
 # to check DHCP lease renewal. DHCP leases are typically hours long.
 # Kconfig range caps this at 10s (range 1-10). Set to max allowed.
 CONFIG_LWIP_DHCP_COARSE_TIMER_SECS=10
+# TCP timer fires unconditionally every TCP_TMR_INTERVAL ms to process
+# delayed ACKs (tcp_fasttmr) and retransmission timeouts (tcp_slowtmr).
+# CONFIG_LWIP_TIMERS_ONDEMAND does NOT cover this timer — it always wakes
+# the CPU from light sleep. Default 250ms = 4 wakes/sec on an idle connection.
+# 1000ms reduces wakes by 75%. Safe for our receive-heavy WebSocket use case:
+# delayed ACKs up to 1s (within TCP spec), retransmit granularity 2s (vs 500ms).
+CONFIG_LWIP_TCP_TMR_INTERVAL=1000
 
 # --- mbedTLS (ECDH + AES-GCM encryption) ---
 CONFIG_MBEDTLS_ECDH_C=y

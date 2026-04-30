@@ -52,6 +52,26 @@ static power_source_t s_last_freq_source = POWER_SOURCE_UNKNOWN;
 
 static power_source_t s_source = POWER_SOURCE_UNKNOWN;
 static int s_battery_mv = 0;
+/* True when the ADC reading is plausible enough to trust as a real battery
+ * voltage. Always true on ESP32 (LilyGo T5 has a hardware divider). On
+ * ESP32-S3 it tracks whether the reading is above BATTERY_SENSE_FLOOR_MV —
+ * v1.1 of the custom PCB has no divider, so this stays false there. */
+static bool s_battery_sense_available = true;
+
+/**
+ * Update s_battery_sense_available based on the latest reading.
+ * On ESP32 this is a no-op (LilyGo T5 always has sense). On ESP32-S3 it
+ * latches the result of comparing s_battery_mv against the sanity floor —
+ * a stuck-low reading indicates no battery divider on the PCB.
+ */
+static void update_sense_availability(void)
+{
+#if CONFIG_IDF_TARGET_ESP32S3
+    s_battery_sense_available = (s_battery_mv >= BATTERY_SENSE_FLOOR_MV);
+#else
+    s_battery_sense_available = true;
+#endif
+}
 
 /**
  * Map battery voltage to percentage using LiPo discharge curve.
@@ -87,6 +107,7 @@ esp_err_t power_manager_init(void)
         raw_mv = 0;
     }
     s_battery_mv = raw_mv * BATTERY_VOLTAGE_DIVIDER_RATIO;
+    update_sense_availability();
 
     /* Determine initial power source.
      * ESP32-S3 (custom PCB): detect USB host via SOF frame counter — reliable
@@ -109,6 +130,12 @@ esp_err_t power_manager_init(void)
              s_source == POWER_SOURCE_USB ? "USB" :
              s_source == POWER_SOURCE_BATTERY ? "battery" : "unknown");
 
+    if (!s_battery_sense_available) {
+        ESP_LOGI(TAG, "Battery sense unavailable (reading %d mV < %d mV floor) — "
+                      "low-battery monitoring disabled.",
+                 s_battery_mv, BATTERY_SENSE_FLOOR_MV);
+    }
+
     return ESP_OK;
 }
 
@@ -120,6 +147,7 @@ bool power_manager_check(EventGroupHandle_t system_events)
         return false;
     }
     s_battery_mv = raw_mv * BATTERY_VOLTAGE_DIVIDER_RATIO;
+    update_sense_availability();
 
     /* Update power source.
      * ESP32-S3: direct USB host detection via SOF counter.
@@ -146,22 +174,24 @@ bool power_manager_check(EventGroupHandle_t system_events)
     }
 #endif
 
-    /* CPU frequency scaling on power source transition.
-     * Battery: cap at 160MHz (~30% power savings during active processing).
-     * USB: full 240MHz for responsive operation.
-     * With IDF's auto light sleep the CPU sleeps most of the time, but this
-     * still saves power during the 2-4s active e-paper refresh cycles. */
+    /* CPU frequency and light sleep on power source transition.
+     * Battery: cap at 160MHz + enable light sleep (~1-3mA average).
+     * USB: full 240MHz + disable light sleep (native USB Serial/JTAG on
+     *      ESP32-S3 is powered down during light sleep, causing a bus reset
+     *      and chip reboot). No power saving needed on USB anyway. */
     if (s_source != s_last_freq_source) {
+        bool on_battery = (s_source == POWER_SOURCE_BATTERY);
         esp_pm_config_t pm_cfg = {
-            .max_freq_mhz = (s_source == POWER_SOURCE_BATTERY) ? 160 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+            .max_freq_mhz = on_battery ? 160 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
             .min_freq_mhz = 80,
-            .light_sleep_enable = true
+            .light_sleep_enable = on_battery
         };
         esp_err_t pm_ret = esp_pm_configure(&pm_cfg);
         if (pm_ret == ESP_OK) {
-            ESP_LOGI(TAG, "CPU freq cap set to %d MHz (%s)",
+            ESP_LOGI(TAG, "CPU freq cap set to %d MHz, light sleep %s (%s)",
                      pm_cfg.max_freq_mhz,
-                     s_source == POWER_SOURCE_BATTERY ? "battery" : "USB");
+                     on_battery ? "enabled" : "disabled",
+                     on_battery ? "battery" : "USB");
         }
         s_last_freq_source = s_source;
     }
@@ -180,7 +210,17 @@ bool power_manager_check(EventGroupHandle_t system_events)
 
 bool power_manager_is_critical_battery(void)
 {
+    /* Without a working battery divider we cannot tell low from full — never
+     * trigger the critical-battery shutdown path on those boards (custom PCB v1.1). */
+    if (!s_battery_sense_available) {
+        return false;
+    }
     return s_source == POWER_SOURCE_BATTERY && s_battery_mv < BATTERY_CRITICAL_MV;
+}
+
+bool power_manager_has_valid_battery_reading(void)
+{
+    return s_battery_sense_available;
 }
 
 /**
