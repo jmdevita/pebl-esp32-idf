@@ -492,12 +492,14 @@ esp_err_t security_manager_upload_public_key(const char *server_host,
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Server endpoint: POST /upload?token={auth}&name={device_id}&key_type=ECDH-P256
+    /* Server endpoint: POST /upload?name={device_id}&key_type=ECDH-P256
+     * Auth: Authorization: Bearer {auth_token} header — keeps the token out of
+     * URL-shaped log sinks (Cloudflare analytics, access logs, APM URL tags).
      * Body: multipart/form-data with a "file" field containing PEM public key.
-     * Matches Arduino SecurityManager::uploadPublicKey() format. */
-    char url[512];
-    snprintf(url, sizeof(url), "https://%s/upload?token=%s&name=%s&key_type=ECDH-P256",
-             server_host, auth_token, device_id);
+     * The server still accepts ?token= as a fallback for legacy clients. */
+    char url[256];
+    snprintf(url, sizeof(url), "https://%s/upload?name=%s&key_type=ECDH-P256",
+             server_host, device_id);
 
     /* Build multipart form-data body */
     const char *boundary = "----ESP32ECDHKeyUpload";
@@ -520,6 +522,11 @@ esp_err_t security_manager_upload_public_key(const char *server_host,
     char content_type[80];
     snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
     esp_http_client_set_header(client, "Content-Type", content_type);
+
+    char auth_header[256];
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", auth_token);
+    esp_http_client_set_header(client, "Authorization", auth_header);
+
     esp_http_client_set_post_field(client, body, strlen(body));
 
     esp_err_t ret = esp_http_client_perform(client);
