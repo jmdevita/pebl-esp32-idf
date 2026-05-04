@@ -583,10 +583,30 @@ else
     success "Firmware flashed"
 fi
 
+# --- Read device ID from eFuse MAC ---
+# The firmware derives device.id from the eFuse MAC at first boot using
+# `%02x%02x%02x%02x%02x%02x` (12-char lowercase hex, no separators) — see
+# components/config_manager/config_manager.cpp:auto_generate_device_id().
+# We replicate that formula offline via esptool.py read_mac so the operator
+# learns the ID without needing to power the device on or watch the boot log.
+# This is what gets pasted into the admin Shipping page when attaching tracking.
+echo ""
+info "Reading device MAC..."
+DEVICE_ID=$(esptool.py --port "$PORT" --baud 115200 read_mac 2>/dev/null \
+    | awk '/^MAC: /{print $2; exit}' \
+    | tr -d ':' \
+    | tr '[:upper:]' '[:lower:]')
+
 # --- Done ---
 echo ""
 echo -e "${GREEN}${BOLD}Device flashed successfully!${NC}"
 echo ""
+if [ -n "$DEVICE_ID" ] && [ ${#DEVICE_ID} -eq 12 ]; then
+    echo -e "  ${BOLD}Device ID:${NC} ${CYAN}${DEVICE_ID}${NC}"
+    echo ""
+    echo "  Paste that ID into admin → Shipping → Attach tracking when you ship the unit."
+    echo ""
+fi
 echo "  The device will boot and show the PEBL splash screen."
 echo "  If no seed_networks are configured, it will start a WiFi"
 echo "  captive portal (AP: pebl-setup) for network configuration."
