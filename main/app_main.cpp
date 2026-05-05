@@ -185,27 +185,43 @@ static void stop_ws_timers(void) {
 }
 
 /**
- * OTA download progress callback — updates e-paper display at 20% intervals.
- * E-paper refresh is slow (~1-2s), so fewer updates = faster install.
+ * OTA download progress callback — switches the e-paper to an "Installing"
+ * frame when the download completes. Percentage updates are intentionally
+ * not rendered: e-paper 4-gray refresh (~3.5s) is slower than the OTA's
+ * progress cadence (~1.5s), so any percent frame paints stale and the queue
+ * backs up — a queued "60%" was painting after install on ESP32-S3.
+ * Serial log still emits 20% checkpoints for debugging.
  * Accesses file-static display_queue (same translation unit).
  */
 static void ota_display_progress_cb(size_t current, size_t total)
 {
-    static int last_percent = 0;  /* Start at 0 to skip redundant 0% update —
-                                   * "Downloading vX.Y.Z" screen already conveys this */
+    static int last_logged_percent = -1;
+    static bool install_frame_shown = false;
+
+    /* Reset per-OTA state when a new download begins (current==0) so a
+     * subsequent OTA attempt in the same boot session re-fires the frame. */
+    if (current == 0) {
+        last_logged_percent = -1;
+        install_frame_shown = false;
+    }
+
     int percent = (total > 0) ? (int)((current * 100) / total) : 0;
-    if (percent != last_percent && percent % 20 == 0) {
-        last_percent = percent;
+    if (percent != last_logged_percent && percent % 20 == 0) {
+        last_logged_percent = percent;
         ESP_LOGI(TAG, "OTA download: %d%%", percent);
+    }
+
+    /* Switch display to "Installing" stage at 100%. The frame paints during
+     * the post-download verify+install (~1s) and the pre-reboot vTaskDelay
+     * in ota_check_with_display, which together exceed the e-paper refresh. */
+    if (current >= total && total > 0 && !install_frame_shown) {
+        install_frame_shown = true;
         display_event_t evt = {};
         evt.type = DISPLAY_EVT_STATUS;
         snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Firmware Update");
-        snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "%d%%", percent);
-        snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "Please wait");
+        snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "Installing");
+        snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "Restarting...");
         xQueueSend(display_queue, &evt, pdMS_TO_TICKS(100));
-    }
-    if (current >= total) {
-        last_percent = 0;  /* Reset for next OTA cycle */
     }
 }
 
@@ -231,16 +247,15 @@ static void ota_check_with_display(void)
     snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "Please wait");
     xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
 
-    /* Download and install with progress display */
+    /* Download and install with progress display. The progress callback
+     * queues an "Installing / Restarting..." frame when download hits 100%;
+     * the pre-reboot delay below gives that frame time to paint fully. */
     ret = ota_manager_download_and_install(&info, ota_display_progress_cb);
     if (ret == ESP_OK) {
-        evt = {};
-        evt.type = DISPLAY_EVT_STATUS;
-        snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Update Complete");
-        snprintf(evt.data.status.line2, sizeof(evt.data.status.line2), "v%s installed", info.version);
-        snprintf(evt.data.status.line3, sizeof(evt.data.status.line3), "Rebooting...");
-        xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
-        vTaskDelay(pdMS_TO_TICKS(3000));  /* Let display render before restart */
+        /* 4s covers e-paper 4-gray FAST refresh (~3.5s) plus a small margin.
+         * The "Installing / Restarting..." frame was queued at 100% download
+         * and is painting during this delay. */
+        vTaskDelay(pdMS_TO_TICKS(4000));
         ota_manager_finalize_and_restart(info.version);
         /* Does not return */
     } else {
