@@ -705,20 +705,23 @@ static void render_broadcast(const display_event_t *evt)
 }
 
 /**
- * Render pairing code screen — matches Arduino DisplayManager::showPairingCode().
- * Shows pairing code in an outlined box with instructions to enter it
- * in the Slack/Discord bot's /link command. No QR code — the code is
- * short enough (XXXX-XXXX) to type manually.
+ * Render pairing code screen.
  *
- * Layout:
+ * Platform-agnostic: directs users to pebl.ink/connect (the marketing site's
+ * platform picker), which fans out to Slack/Discord/GitHub OAuth and any
+ * future platform without firmware changes. QR encodes the URL only — the
+ * code is shown human-readable since /connect doesn't consume a query param.
+ *
+ * Layout (250x122 panel):
  *   [battery top-right]  [power status top-center]
- *   "Pair Your Device"              (FreeSans9pt, x=10, y=30)
- *   ┌─────────────┐
- *   │  ABCD-1234  │                (FreeSansBold9pt, outlined box at y=38)
- *   └─────────────┘
- *   "Type /link in Slack"           (FreeSans9pt, below box)
- *   "or Discord to pair"            (FreeSans9pt, below)
- *   "ID: 2cbcbba86c74"             (built-in 5x7, bottom)
+ *   Pair Your Device                              (bold 9pt, full-width, y=24)
+ *   ┌──────┐  ┌───────────────┐                   (QR v2 50x50 + code box)
+ *   │  QR  │  │   ABCD-1234   │
+ *   │ 50x50│  └───────────────┘
+ *   │      │  Go to                               (built-in 5x7, instructions)
+ *   └──────┘  pebl.ink/connect
+ *             to link a platform
+ *   ID: 2cbcbba86c74                              (built-in 5x7, bottom)
  */
 static void render_pairing_code(const char *code)
 {
@@ -730,39 +733,109 @@ static void render_pairing_code(const char *code)
     draw_battery_indicator();
     draw_power_status_text();
 
-    /* Title */
-    set_font(FONT_SANS_9PT);
-    display.setCursor(10, 30);
+    /* Title (full-width, bold 9pt) */
+    set_font(FONT_SANS_BOLD_9PT);
+    display.setCursor(10, 24);
     display.print("Pair Your Device");
 
-    /* Pairing code in outlined box for visual prominence */
-    set_font(FONT_SANS_BOLD_9PT);
-    int16_t tx, ty;
-    uint16_t tw, th;
-    display.getTextBounds(code, 0, 0, &tx, &ty, &tw, &th);
-    const int boxPad = 6;
-    const int boxX = 8;
-    const int boxY = 38;
-    const int boxW = tw + boxPad * 2;
-    const int boxH = th + boxPad * 2;
-    display.drawRect(boxX, boxY, boxW, boxH, COLOR_BLACK);
-    display.setCursor(boxX + boxPad - tx, boxY + boxPad - ty);
-    display.print(code);
+    /* QR code on left — encodes the connect URL.
+     * "https://pebl.ink/connect" = 24 chars, fits in QR v2 (25x25 modules).
+     * At scale 2 → 50x50 px. */
+    const char *qr_data = "https://pebl.ink/connect";
 
-    /* Instructions below the box */
-    int instrY = boxY + boxH + 14;
-    set_font(FONT_SANS_9PT);
-    display.setCursor(10, instrY);
-    display.print("Type /link in Slack");
-    display.setCursor(10, instrY + 16);
-    display.print("or Discord to pair");
+    esp_qrcode_config_t qr_cfg = {
+        .display_func_with_cb = NULL,
+        .max_qrcode_version = 2,
+        .qrcode_ecc_level = ESP_QRCODE_ECC_LOW,
+        .user_data = (void *)code,
+    };
 
-    /* Device ID in small font at bottom */
+    /* The qrcode component renders via callback. We draw the QR modules and
+     * the right-column text inline so the display.update() happens once. */
+    struct PairQrHelper {
+        static void callback(esp_qrcode_handle_t qrcode, void *user_data) {
+            const char *code_str = (const char *)user_data;
+            int qr_size = esp_qrcode_get_size(qrcode);
+
+            const uint8_t scale = 2;
+            const int16_t qrX = 10;
+            const int16_t qrY = 32;
+
+            /* Draw QR modules */
+            for (int y = 0; y < qr_size; y++) {
+                for (int x = 0; x < qr_size; x++) {
+                    if (esp_qrcode_get_module(qrcode, x, y)) {
+                        display.fillRect(qrX + x * scale, qrY + y * scale,
+                                         scale, scale, COLOR_BLACK);
+                    }
+                }
+            }
+
+            /* Right column starts past the QR with a small gap. */
+            const int16_t colX = qrX + qr_size * scale + 10;
+
+            /* Pairing code in outlined box (bold 9pt) */
+            set_font(FONT_SANS_BOLD_9PT);
+            int16_t tx, ty;
+            uint16_t tw, th;
+            display.getTextBounds(code_str, 0, 0, &tx, &ty, &tw, &th);
+            const int boxPad = 5;
+            const int boxX = colX;
+            const int boxY = qrY;
+            const int boxW = tw + boxPad * 2;
+            const int boxH = th + boxPad * 2;
+            display.drawRect(boxX, boxY, boxW, boxH, COLOR_BLACK);
+            display.setCursor(boxX + boxPad - tx, boxY + boxPad - ty);
+            display.print(code_str);
+
+            /* Instructions below the code box (built-in 5x7 — small font).
+             * Built-in font cursor is top-left (vs baseline for custom fonts). */
+            display.setFont(NULL);
+            const int16_t instrX = colX;
+            int16_t instrY = boxY + boxH + 8;
+            display.setCursor(instrX, instrY);
+            display.print("Go to");
+            display.setCursor(instrX, instrY + 12);
+            display.print("pebl.ink/connect");
+            display.setCursor(instrX, instrY + 24);
+            display.print("to link a platform");
+        }
+    };
+
+    qr_cfg.display_func_with_cb = PairQrHelper::callback;
+
+    esp_err_t ret = esp_qrcode_generate(&qr_cfg, qr_data);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Pairing QR generation failed: %s", esp_err_to_name(ret));
+        /* Fallback: text-only layout if QR generation fails. */
+        set_font(FONT_SANS_BOLD_9PT);
+        int16_t tx, ty;
+        uint16_t tw, th;
+        display.getTextBounds(code, 0, 0, &tx, &ty, &tw, &th);
+        const int boxPad = 6;
+        const int boxX = 8;
+        const int boxY = 40;
+        const int boxW = tw + boxPad * 2;
+        const int boxH = th + boxPad * 2;
+        display.drawRect(boxX, boxY, boxW, boxH, COLOR_BLACK);
+        display.setCursor(boxX + boxPad - tx, boxY + boxPad - ty);
+        display.print(code);
+
+        display.setFont(NULL);
+        display.setCursor(10, boxY + boxH + 8);
+        display.print("Go to pebl.ink/connect");
+        display.setCursor(10, boxY + boxH + 20);
+        display.print("to link a platform");
+    }
+
+    /* Device ID in small font at bottom — -14 leaves room for 7-8px glyph
+     * plus a safety margin so the bottom of the text isn't clipped on either
+     * the GDEW (122-tall, no inset) or GDEY (128-tall, 6-px clipped). */
     const app_config_t *cfg = config_manager_get_config();
     char id_label[28];
     snprintf(id_label, sizeof(id_label), "ID: %.20s", cfg->device.id);
     display.setFont(NULL);  /* Built-in 5x7 font */
-    display.setCursor(10, instrY + 34);
+    display.setCursor(10, display.height() - SCREEN_BOTTOM_INSET - 14);
     display.print(id_label);
 
     display.update();

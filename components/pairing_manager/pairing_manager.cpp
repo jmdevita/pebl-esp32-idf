@@ -140,8 +140,9 @@ esp_err_t pairing_manager_start(QueueHandle_t display_queue,
     saved_session_id[sizeof(saved_session_id) - 1] = '\0';
 
     /* Step 2: Display pairing code on e-paper.
-     * The QR encodes a help URL; the pairing code is shown prominently
-     * for the user to type into the Slack/Discord bot's /link command. */
+     * The QR encodes pebl.ink/connect (platform picker); the pairing code is
+     * shown human-readable for the user to enter on the /pair page after
+     * choosing a platform. URL is rendered into the QR by the display layer. */
     display_event_t evt = {
         .type = DISPLAY_EVT_PAIRING_QR,
     };
