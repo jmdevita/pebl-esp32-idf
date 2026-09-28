@@ -70,4 +70,10 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
 
 # --- Watchdog ---
+# The task watchdog watches the idle tasks: if any task keeps a CPU busy for
+# 30s without yielding, panic and reset instead of hanging silently. A reset
+# during an update's probation boots the previous firmware, and after
+# confirmation it feeds the OTA crash-loop guard (see ota_manager.cpp).
+# All e-paper busy-waits yield (vTaskDelay), so long refreshes don't trip it.
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_ESP_TASK_WDT_PANIC=y

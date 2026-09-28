@@ -108,7 +108,24 @@ esp32_idf_client/
 └── partitions.csv                     # OTA-compatible partition table
 ```
 
-Partition table is identical to the Arduino client — devices can OTA-cross between firmwares.
+Partition table is identical to the Arduino client, so an Arduino device can OTA onto this
+firmware. The reverse is refused: this firmware only installs images with its own project name.
+
+### OTA safety
+
+- **Verified before switching:** image header (project name, version), SHA-256 and ECDSA signature
+  are checked before the new slot becomes bootable. Downgrades are refused.
+- **Probation:** the first boot of an update is not marked valid until it reaches the server (boot
+  firmware check or WebSocket registration). A crash, watchdog reset or power loss before that boots
+  the previous firmware; so does a 10-minute self-test timeout.
+- **Crash-loop guard:** for an hour after confirmation, 3 panic/watchdog resets switch back to the
+  previous slot.
+- **Failure memory:** an image that fails twice (crashed or timed out on first boot, or bad
+  header/hash/signature) is not retried. Memory is keyed on version + sha256, so publishing a
+  corrected build (same or higher version) installs normally. Power-related rollbacks (brownout,
+  power loss) are reported but not counted.
+- **Reporting:** every outcome is POSTed to `/api/firmware/stats` and lands in `update_logs` as
+  `update_success`, `update_rollback` or `update_failed` (with the reason).
 
 ## Troubleshooting
 
@@ -118,7 +135,7 @@ Partition table is identical to the Arduino client — devices can OTA-cross bet
 | Won't connect to Wi-Fi     | 2.4 GHz network; password correct in captive portal            |
 | Pairing QR never appears   | `data/config.json` `server.host` reachable; check serial logs  |
 | Build fails, missing venv  | `source ~/esp/esp-idf/export.sh` before `idf.py`               |
-| OTA stalls                 | `display_variant` in config matches a published firmware lane  |
+| OTA stalls                 | `display_variant` in config matches a published firmware lane; `update_logs` for `update_failed` / `update_rollback` |
 
 Serial logs are the fastest path — `idf.py monitor` after a flash.
 

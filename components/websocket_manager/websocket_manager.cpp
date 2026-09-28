@@ -262,8 +262,11 @@ static void handle_broadcast_message(const cJSON *source, bool was_encrypted)
     atomic_store(&s_last_reaction_us, esp_timer_get_time());
 }
 
-/* Firmware update flags — set by WS event handler, consumed by ws_task.
- * Required updates install immediately; optional updates wait for 5 min idle. */
+/* Firmware update flags — set by WS event handler, read by ws_task.
+ * Required updates install immediately; optional updates wait for 5 min idle.
+ * Reading does not clear them: a deferred optional update must still be pending
+ * when the 60s re-evaluation fires. ws_task clears them only when it actually
+ * starts an install attempt (websocket_manager_clear_pending_firmware()). */
 static atomic_bool s_pending_firmware_required = false;
 static atomic_bool s_pending_firmware_optional = false;
 
@@ -741,12 +744,18 @@ esp_err_t websocket_manager_send(const char *data, int len)
 
 bool websocket_manager_has_pending_firmware_required(void)
 {
-    return atomic_exchange(&s_pending_firmware_required, false);
+    return atomic_load(&s_pending_firmware_required);
 }
 
 bool websocket_manager_has_pending_firmware_optional(void)
 {
-    return atomic_exchange(&s_pending_firmware_optional, false);
+    return atomic_load(&s_pending_firmware_optional);
+}
+
+void websocket_manager_clear_pending_firmware(void)
+{
+    atomic_store(&s_pending_firmware_required, false);
+    atomic_store(&s_pending_firmware_optional, false);
 }
 
 int64_t websocket_manager_get_last_reaction_time(void)

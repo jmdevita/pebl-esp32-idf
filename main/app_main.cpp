@@ -309,7 +309,7 @@ static void ota_check_with_display(void)
          * The "Installing / Restarting..." frame was queued at 100% download
          * and is painting during this delay. */
         vTaskDelay(pdMS_TO_TICKS(4000));
-        ota_manager_finalize_and_restart(info.version);
+        ota_manager_finalize_and_restart(&info);
         /* Does not return */
     } else {
         evt = {};
@@ -427,8 +427,23 @@ static void ws_task(void *arg)
             websocket_manager_process(system_events);
         }
 
+        /* Self-test checkpoint for a probationary image whose boot firmware check
+         * didn't get through (server briefly down, or OTA disabled in config):
+         * registering on the WebSocket proves the same thing. */
+        if (ota_manager_is_pending_verify() && websocket_manager_is_connected()) {
+            ota_manager_confirm("websocket registered");
+            /* Report the success now: the boot-time report ran while still on
+             * probation and skipped, and a light-sleep device may not reboot
+             * for weeks. */
+            ota_manager_check_on_boot();
+        }
+
         /* --- Server errors (immediate, from WS callback) --- */
         if (bits & EVT_WS_ERROR) {
+            /* The server answered (not linked / trial expired / auth), so the
+             * firmware works; several branches below restart or deep-sleep, which
+             * would otherwise roll back a probationary image. */
+            ota_manager_confirm("server responded on websocket");
             ws_error_info_t error_info;
             ws_error_code_t ws_error = websocket_manager_get_pending_error(&error_info);
 
@@ -597,6 +612,8 @@ static void ws_task(void *arg)
          * pairing_manager does TLS HTTP requests requiring ~10-16KB via mbedtls. */
         if (bits & EVT_PAIRING_REQUEST) {
             ESP_LOGI(TAG, "Button-triggered pairing mode");
+            /* User-started flow that ends in a restart — must not roll back. */
+            ota_manager_confirm("user started pairing");
             esp_timer_stop(s_health_timer);
             esp_timer_stop(s_heartbeat_timer);
             websocket_manager_stop();
@@ -627,6 +644,8 @@ static void ws_task(void *arg)
          * Matches Arduino: startProvisioning(true) runs inline, no reboot. */
         if (bits & EVT_WIFI_PORTAL_REQUEST) {
             ESP_LOGI(TAG, "Button-triggered WiFi provisioning");
+            /* User-started flow that ends in a restart — must not roll back. */
+            ota_manager_confirm("user started WiFi setup");
             esp_timer_stop(s_health_timer);
             esp_timer_stop(s_heartbeat_timer);
             websocket_manager_stop();
@@ -713,8 +732,12 @@ static void ws_task(void *arg)
 
         /* --- Firmware updates (immediate, from WS callback) --- */
         if (bits & EVT_WS_FIRMWARE) {
+            /* The pending flags stay set until an install attempt starts, so a
+             * deferred optional update is still pending when the 60s re-evaluation
+             * timer fires. */
             if (websocket_manager_has_pending_firmware_required()) {
                 ESP_LOGI(TAG, "Required firmware update — installing now");
+                websocket_manager_clear_pending_firmware();
                 ota_check_with_display();
             } else if (websocket_manager_has_pending_firmware_optional()) {
                 int64_t last_reaction = websocket_manager_get_last_reaction_time();
@@ -722,6 +745,7 @@ static void ws_task(void *arg)
                 if (idle_ms > 5 * 60 * 1000) {
                     ESP_LOGI(TAG, "Optional firmware update — device idle for %lld min",
                              idle_ms / 60000);
+                    websocket_manager_clear_pending_firmware();
                     ota_check_with_display();
                 } else {
                     ESP_LOGI(TAG, "Optional firmware update deferred — device active (%lld s idle)",
@@ -1536,12 +1560,13 @@ extern "C" void app_main(void)
         }
     }
 
-    /* 3b. Mark firmware valid immediately after basic init succeeds.
-     * Called before WiFi to prevent OTA rollback if the device enters the captive
-     * portal (no credentials on first boot after cross-firmware OTA migration).
-     * Mirrors Arduino's checkBootValidation() timing — if we can init NVS, config,
-     * and board, the firmware is functional. Network reporting is deferred to step 15. */
-    ota_manager_mark_valid_on_boot();
+    /* 3b. OTA boot bookkeeping — before anything that can deep-sleep or restart.
+     * On the first boot after an update the image stays on probation (NOT marked
+     * valid) until it reaches the server: the boot firmware check (step 15b) or
+     * WebSocket registration confirms it. Until then any reset — crash, watchdog,
+     * power loss, deep sleep — boots the previous firmware. Also detects a rolled-back
+     * update and runs the post-update crash-loop guard. See ota_manager.cpp. */
+    ota_manager_boot_init();
 
     /* 4. Check wake reason for deep sleep recovery */
     esp_sleep_wakeup_cause_t wake_reason = esp_sleep_get_wakeup_cause();
@@ -1756,6 +1781,12 @@ extern "C" void app_main(void)
             power_manager_deep_sleep(nap_us);  /* does not return */
         }
 
+        /* No confirm here even with no stored networks: the previous firmware had
+         * WiFi moments ago (it downloaded this image), so a probationary image that
+         * can't connect — or can't read its credentials — points at the update, and
+         * the 10-minute self-test timeout rolls it back. The one case where that's
+         * wrong, an image installed by the Arduino firmware, is confirmed in
+         * ota_manager_boot_init() instead. */
         ESP_LOGW(TAG, "WiFi connection failed, starting captive portal");
 
         /* Show WiFi provisioning screen with QR code and instructions */
@@ -1862,10 +1893,7 @@ extern "C" void app_main(void)
         }
     }
 
-    /* 15. Check for OTA updates (non-blocking, skip if recently checked) */
-    ota_manager_check_on_boot();
-
-    /* 15b. Check server for available firmware updates.
+    /* 15. Check server for available firmware updates.
      * Random 0-60s jitter avoids thundering herd when many devices power on together
      * (e.g., after a power outage in a fleet deployment).
      * Only applied when fleet jitter is enabled (reconnect_jitter_max_sec > 0);
@@ -1876,7 +1904,13 @@ extern "C" void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(ota_jitter_ms));
     }
     ESP_LOGI(TAG, "Checking for firmware updates on boot");
-    ota_check_with_display();  // If update found: downloads, verifies, restarts
+    ota_check_with_display();  // If update found: downloads, verifies, restarts.
+                               // A 200 from the server also confirms a probationary image.
+
+    /* 15b. Report the previous update's outcome (success or rollback). After the
+     * check so a probationary image has been confirmed first; if the check installed
+     * a newer version, finalize already flushed this report before restarting. */
+    ota_manager_check_on_boot();
 
     /* 16. Enable auto light sleep with WiFi DTIM power save */
     enable_light_sleep();

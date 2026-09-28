@@ -82,12 +82,18 @@ bool websocket_manager_is_connected(void);
 esp_err_t websocket_manager_send(const char *data, int len);
 
 /**
- * Check and consume pending firmware update flags.
+ * Check pending firmware update flags (set by a server firmware_update push).
  * Returns true if a required or optional firmware update was signaled.
- * Clears the flag atomically (one-shot).
+ * Does not clear the flag — call websocket_manager_clear_pending_firmware()
+ * when an install attempt starts, so a deferred update survives re-evaluation.
  */
 bool websocket_manager_has_pending_firmware_required(void);
 bool websocket_manager_has_pending_firmware_optional(void);
+
+/**
+ * Clear both pending firmware flags. Call immediately before an install attempt.
+ */
+void websocket_manager_clear_pending_firmware(void);
 
 /**
  * Get timestamp (in microseconds) of the last reaction delivered.
