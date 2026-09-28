@@ -538,8 +538,17 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
         }
         break;
 
+    /* CLOSED: the server closed the connection with a close frame (e.g. a
+     * graceful restart, or a duplicate / rate-limited connect refused after
+     * accept). With enable_close_reconnect set, the client then reconnects
+     * after reconnect_timeout_ms just like after DISCONNECTED, so both events
+     * share the same bookkeeping. Without this case s_connected stayed true
+     * after a server close, and nothing noticed until the 90s heartbeat
+     * timeout. */
+    case WEBSOCKET_EVENT_CLOSED:
     case WEBSOCKET_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "WebSocket disconnected");
+        ESP_LOGW(TAG, "WebSocket %s",
+                 event_id == WEBSOCKET_EVENT_CLOSED ? "closed by server" : "disconnected");
         atomic_store(&s_connected, false);
         atomic_store(&s_registered, false);
         resilience_manager_mark_connection_lost();
@@ -591,6 +600,16 @@ esp_err_t websocket_manager_start(QueueHandle_t display_queue)
         .network_timeout_ms = 10000,
         .ping_interval_sec = WS_PING_INTERVAL_SEC,
     };
+
+    /* Reconnect after a server-initiated close frame too. Without it,
+     * esp_websocket_client ends its task on a server close (it only
+     * auto-reconnects after transport errors), so every graceful server
+     * restart left the device offline until the heartbeat timeout restarted
+     * the client. The firmware never closes the socket itself (it uses
+     * esp_websocket_client_stop), so this only affects closes the server
+     * initiates. Set after the initializer: C++ designated initializers must
+     * follow the struct's field order, and this field precedes task_stack. */
+    ws_cfg.enable_close_reconnect = true;
 
     if (cfg->server.use_ssl) {
         ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
