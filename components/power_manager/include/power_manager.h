@@ -48,49 +48,19 @@ typedef enum {
 } power_source_t;
 
 /**
- * Button press action returned by power_manager_handle_button().
- * The caller (button_task in app_main) is responsible for executing the
- * action, which may include display rendering. This avoids a circular
- * dependency between power_manager and display_manager.
- */
-typedef enum {
-    BUTTON_ACTION_NONE,           /* No action (press too short or debounce) */
-    BUTTON_ACTION_SHOW_STATUS,    /* Short press: show battery/connection status */
-    BUTTON_ACTION_ENTER_PAIRING,  /* Medium press (3-9s): re-enter pairing mode */
-    BUTTON_ACTION_WIFI_PORTAL,    /* Long press (15s+): factory reset WiFi */
-} button_action_t;
-
-/**
- * Status info populated by power_manager_handle_button() for display.
- */
-typedef struct {
-    button_action_t action;
-    uint8_t battery_percent;
-    int battery_mv;
-    power_source_t source;
-    bool has_auth_token;  /* true if device is paired (has auth token) */
-} button_result_t;
-
-/**
  * Initialize power manager: configure ADC, set initial thresholds.
  */
 esp_err_t power_manager_init(void);
 
 /**
- * Periodic power check (called from power_task every 5 minutes).
- * Reads battery voltage, determines power source, adjusts CPU frequency.
- * Returns true if power source changed (USB↔battery transition).
+ * Periodic power check (called from power_task).
+ * Detects the power source (cheap every call on ESP32-S3), samples battery
+ * voltage at most every 5 minutes, and adjusts CPU frequency / light sleep on a
+ * source transition. Returns true if the power source changed (USB↔battery).
  * Caller should check power_manager_is_critical_battery() afterward and
  * handle deep sleep (with display warning) if true.
  */
 bool power_manager_check(EventGroupHandle_t system_events);
-
-/**
- * Handle physical button press (called from button_task).
- * Measures hold duration and returns an action for the caller to execute.
- * The caller handles display rendering to avoid circular dependencies.
- */
-button_result_t power_manager_handle_button(void);
 
 /**
  * Get current battery voltage in millivolts.

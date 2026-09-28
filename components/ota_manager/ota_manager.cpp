@@ -117,6 +117,37 @@ static bool verify_ecdsa_signature(const uint8_t *hash, const char *signature_b6
 }
 
 /**
+ * Parse the numeric MAJOR.MINOR.PATCH triple from a version string.
+ * Tolerates an optional leading 'v' and any pre-release/build suffix
+ * (e.g. "v2.1.0-rc1" → {2,1,0}); missing components default to 0.
+ * Suffixes are deliberately ignored for the downgrade comparison — RC/beta
+ * ordering is subtle and getting it wrong could block a legitimate update, so
+ * the guard keys only on the well-defined numeric triple.
+ */
+static void parse_semver_numeric(const char *v, int out[3])
+{
+    out[0] = out[1] = out[2] = 0;
+    if (!v) return;
+    if (*v == 'v' || *v == 'V') v++;
+    sscanf(v, "%d.%d.%d", &out[0], &out[1], &out[2]);
+}
+
+/**
+ * Compare two version strings by numeric MAJOR.MINOR.PATCH only.
+ * Returns <0 if a<b, 0 if equal, >0 if a>b.
+ */
+static int semver_compare_numeric(const char *a, const char *b)
+{
+    int va[3], vb[3];
+    parse_semver_numeric(a, va);
+    parse_semver_numeric(b, vb);
+    for (int i = 0; i < 3; i++) {
+        if (va[i] != vb[i]) return va[i] - vb[i];
+    }
+    return 0;
+}
+
+/**
  * Verify firmware image hash and signature.
  *
  * Reads the OTA partition that was just written, computes SHA-256,
@@ -124,9 +155,15 @@ static bool verify_ecdsa_signature(const uint8_t *hash, const char *signature_b6
  */
 static bool verify_firmware(const firmware_info_t *info)
 {
-    if (info->sha256_hash[0] == '\0' && info->signature[0] == '\0') {
-        ESP_LOGW(TAG, "No hash or signature provided — skipping verification");
-        return true;
+    /* Signature is MANDATORY — fail closed. The server always ECDSA-signs
+     * (P-256) firmware, so a response with no signature means either a
+     * misconfigured/compromised server or a tampered download_url followed
+     * verbatim. Installing it would defeat the whole hardcoded-key protection,
+     * so refuse rather than "skip verification" (ESP-4). The SHA-256 hash below
+     * remains an optional integrity pre-check; the signature is the trust root. */
+    if (info->signature[0] == '\0') {
+        ESP_LOGE(TAG, "Firmware response carries no signature — refusing to install (fail closed)");
+        return false;
     }
 
     /* Get the next OTA partition (the one we just wrote to) */
@@ -371,6 +408,19 @@ esp_err_t ota_manager_check_for_update(firmware_info_t *info)
     }
 
     cJSON_Delete(root);
+
+    /* Monotonic-version (anti-downgrade) guard: refuse a target whose numeric
+     * MAJOR.MINOR.PATCH is older than what's running. A signed-but-older build
+     * advertised by a misconfigured or hostile server would otherwise install
+     * and could reintroduce a patched vulnerability. Equal versions never reach
+     * here (server reports up_to_date). Only the numeric triple is compared;
+     * see parse_semver_numeric() for the RC/beta-suffix rationale. */
+    if (semver_compare_numeric(info->version, app_desc->version) < 0) {
+        ESP_LOGE(TAG, "Refusing firmware downgrade: offered %s < running %s",
+                 info->version, app_desc->version);
+        s_status = OTA_STATUS_IDLE;
+        return ESP_ERR_INVALID_VERSION;
+    }
 
     ESP_LOGI(TAG, "Update available: %s (%u bytes, required=%d)",
              info->version, info->size, info->required);

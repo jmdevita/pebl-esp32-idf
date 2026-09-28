@@ -79,15 +79,36 @@ static char *http_request(const char *url, esp_http_client_method_t method,
         return NULL;
     }
 
-    int read_len = esp_http_client_read(client, response, content_len);
+    /* Loop reads until the body is complete. A single esp_http_client_read()
+     * can return a short read for chunked / unknown-length responses (it returns
+     * whatever is currently buffered), which previously truncated the JSON and
+     * made the initial /api/pairing/request hard-fail. Mirrors the read loop in
+     * ota_manager's check-for-update. The fixed buffer bound is preserved:
+     * we never read past `content_len` bytes. */
+    int total_read = 0;
+    while (total_read < content_len) {
+        int r = esp_http_client_read(client, response + total_read,
+                                     content_len - total_read);
+        if (r < 0) {
+            /* Transport error mid-read — discard the partial body */
+            total_read = -1;
+            break;
+        }
+        if (r == 0) {
+            /* No more data: connection closed or full body already received */
+            break;
+        }
+        total_read += r;
+    }
+
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
-    if (read_len <= 0) {
+    if (total_read <= 0) {
         free(response);
         return NULL;
     }
-    response[read_len] = '\0';
+    response[total_read] = '\0';
     return response;
 }
 
@@ -140,14 +161,13 @@ esp_err_t pairing_manager_start(QueueHandle_t display_queue,
     saved_session_id[sizeof(saved_session_id) - 1] = '\0';
 
     /* Step 2: Display pairing code on e-paper.
-     * The QR encodes pebl.ink/connect (platform picker); the pairing code is
-     * shown human-readable for the user to enter on the /pair page after
-     * choosing a platform. URL is rendered into the QR by the display layer. */
+     * render_pairing_code() encodes a fixed https://pebl.ink/connect URL in the
+     * QR itself and shows the pairing code human-readable, so only the code is
+     * passed through the event. (The display layer does not read
+     * data.pairing.url — that field is left unset intentionally.) */
     display_event_t evt = {
         .type = DISPLAY_EVT_PAIRING_QR,
     };
-    snprintf(evt.data.pairing.url, sizeof(evt.data.pairing.url),
-             "https://%s", cfg->server.host);
     strncpy(evt.data.pairing.code, pairing_code->valuestring, sizeof(evt.data.pairing.code) - 1);
     xQueueSend(display_queue, &evt, portMAX_DELAY);
 

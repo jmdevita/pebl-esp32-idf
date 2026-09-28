@@ -115,17 +115,10 @@ static bool s_initialized = false;
  */
 #define EMOJI_X          10   /* Emoji top-left X position */
 #define EMOJI_Y          32   /* Emoji top-left Y position */
-#define EMOJI_SIZE       64   /* Target emoji render size in pixels */
 #define TEXT_X           60   /* Text column X (right of emoji) */
 #define USERNAME_Y       42   /* Username Y position */
 #define MESSAGE_Y        62   /* Message preview Y position */
 #define CHANNEL_Y        92   /* Channel line Y position (bottom area) */
-
-/* QR code rendering parameters */
-#define QR_MODULE_SIZE   3    /* Pixels per QR module (pairing QR) */
-#define QR_OFFSET_X      10   /* QR code X offset (pairing QR) */
-#define QR_OFFSET_Y      5    /* QR code Y offset (pairing QR) */
-#define QR_VERSION        6   /* QR version for pairing (handles URLs up to ~134 chars) */
 
 /* Color definitions — use CalEPD's gdew_colors.h values (16-bit RGB565).
  * fillScreen() compares against EPD_WHITE (0xFFFF) to decide buffer fill value.
@@ -223,18 +216,31 @@ static bool supports_grayscale(void)
 #endif
 }
 
+/* Tracks whether the current full-screen render left the panel in 4-gray mode.
+ * Partial-refresh helpers (top status bar, dot animation) always draw in mono
+ * but must restore this base mode afterward, so the untouched remainder of a
+ * 4-gray screen (an emoji reaction) stays consistent. Defaults to mono. */
+static bool s_grayscale_active = false;
+
 /**
- * Enable 4-gray mode permanently at init. Called once from display_manager_init().
- * Text drawn with EPD_BLACK (0) and EPD_WHITE (0xFFFF) maps correctly to the
- * black and white gray levels in drawPixel (color >> 6 → 0 or 3), so there's
- * no need to switch back to mono mode for text screens.
- * This matches the Arduino client which stays in 4-gray mode permanently.
+ * Select the e-paper refresh waveform for the next full-screen render.
+ *
+ * 4-gray mode uses a slow multi-frame grayscale waveform (and on GDEW panels a
+ * double refresh after a hibernate wake) that is only needed for screens which
+ * actually contain gray levels — i.e. emoji reactions. Pure black/white screens
+ * (splash, status, connected/disconnected, pairing, low-battery, purchase,
+ * broadcast, diagnostics) render identically under the fast mono waveform, so
+ * we drop to mono for them to roughly halve refresh time and energy on the most
+ * common screens. Text drawn with EPD_BLACK/EPD_WHITE maps correctly in both
+ * modes (color >> 6 → 0 or 3), so only the waveform changes, never the pixels.
+ *
+ * No-op on panels without grayscale support (they are always mono).
  */
-static void enable_grayscale(void)
+static void set_grayscale_mode(bool enable)
 {
 #if defined(CONFIG_DISPLAY_DEPG0213BN) || defined(CONFIG_DISPLAY_GDEY0213B74) || defined(CONFIG_DISPLAY_GDEW0213I5F)
-    display.setMonoMode(false);
-    ESP_LOGI(TAG, "4-level grayscale mode enabled");
+    display.setMonoMode(!enable);
+    s_grayscale_active = enable;
 #endif
 }
 
@@ -1026,7 +1032,9 @@ static void animate_dots(void)
     }
 
     display.updateWindow(region_x, s_dot_region_y, region_w, DOT_REGION_H);
-    display.setMonoMode(false);
+    /* Restore the base full-screen mode (mono for the disconnected screen this
+     * animates over; kept general so a 4-gray screen underneath stays intact). */
+    display.setMonoMode(!s_grayscale_active);
     board_release_wake_lock();
 }
 
@@ -1521,7 +1529,10 @@ esp_err_t display_manager_init(bool is_deep_sleep_wake)
         return ESP_FAIL;
     }
     s_initialized = true;
-    enable_grayscale();
+    /* Establish a known base mode. Splash and all other screens except the
+     * emoji reaction are pure black/white, so default to the fast mono
+     * waveform; render_reaction switches to 4-gray only for its own render. */
+    set_grayscale_mode(false);
 
     if (!is_deep_sleep_wake) {
         render_splash();
@@ -1541,7 +1552,8 @@ static void render_power_change(bool show_lock)
 {
     /* Draw into mono buffer for partial refresh.
      * Partial refresh is mono-only (uses _buffer, not _buffer1/_buffer2).
-     * Restore grayscale mode afterward so subsequent reaction renders use 4-gray. */
+     * The base mode is restored afterward so the rest of the screen underneath
+     * (which may be a 4-gray reaction) stays consistent. */
     display.setMonoMode(true);
 
     /* Clear the top bar region in the framebuffer (32 rows, byte-aligned) */
@@ -1557,8 +1569,9 @@ static void render_power_change(bool show_lock)
     /* Partial refresh — only sends the top 32 rows to the controller */
     display.updateWindow(0, 0, display.width(), 32);
 
-    /* Restore grayscale mode for subsequent reaction/broadcast renders */
-    display.setMonoMode(false);
+    /* Restore the base full-screen mode (e.g. 4-gray if this partial refresh
+     * ran on top of an emoji reaction screen). */
+    display.setMonoMode(!s_grayscale_active);
 }
 
 void display_manager_render(display_event_t *evt)
@@ -1571,6 +1584,15 @@ void display_manager_render(display_event_t *evt)
      * the 2-4 second refresh cycle — sleeping mid-transaction corrupts
      * the display update. */
     board_acquire_wake_lock();
+
+    /* Pick the refresh waveform for this full-screen render: only the emoji
+     * reaction screen contains gray levels, so everything else uses the fast
+     * mono waveform (see set_grayscale_mode). POWER_CHANGE is excluded — it is
+     * a mono partial refresh of just the top status bar that manages its own
+     * mode and must not disturb the base mode of the screen underneath it. */
+    if (evt->type != DISPLAY_EVT_POWER_CHANGE) {
+        set_grayscale_mode(evt->type == DISPLAY_EVT_REACTION);
+    }
 
     switch (evt->type) {
     case DISPLAY_EVT_REACTION:

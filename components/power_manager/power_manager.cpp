@@ -141,18 +141,32 @@ esp_err_t power_manager_init(void)
 
 bool power_manager_check(EventGroupHandle_t system_events)
 {
-    /* Read battery voltage */
-    int raw_mv = board_adc_read_battery_mv();
-    if (raw_mv < 0) {
-        return false;
+    int64_t now = esp_timer_get_time();
+    bool transition = false;
+
+    /* Full battery ADC sampling (16 samples × 5ms ≈ 80ms) is comparatively
+     * expensive and battery voltage drifts slowly (~1mV/min under light load),
+     * so read it at most every 5 minutes even though power_task now loops more
+     * frequently to catch USB transitions quickly (ESP-M7). */
+    static int64_t s_last_battery_read_us = 0;
+    bool do_battery_read = (s_last_battery_read_us == 0) ||
+                           (now - s_last_battery_read_us >= 5LL * 60 * 1000000);
+    if (do_battery_read) {
+        int raw_mv = board_adc_read_battery_mv();
+        if (raw_mv >= 0) {
+            s_battery_mv = raw_mv * BATTERY_VOLTAGE_DIVIDER_RATIO;
+            update_sense_availability();
+        }
+        s_last_battery_read_us = now;
     }
-    s_battery_mv = raw_mv * BATTERY_VOLTAGE_DIVIDER_RATIO;
-    update_sense_availability();
 
     /* Update power source.
-     * ESP32-S3: direct USB host detection via SOF counter.
-     * ESP32: voltage threshold with hysteresis to avoid flip-flopping. */
-    bool transition = false;
+     * ESP32-S3: direct USB host detection via SOF counter — cheap (~3ms), so run
+     *   it every call so an unplug/replug is noticed within the power_task loop
+     *   interval (~30s) instead of only on the 5-minute battery cadence. This is
+     *   what lets light sleep re-enable soon after unplug on the S3 (ESP-M7).
+     * ESP32: voltage threshold with hysteresis — only meaningful right after a
+     *   battery read refreshed s_battery_mv. */
 #if CONFIG_IDF_TARGET_ESP32S3
     power_source_t new_source = usb_host_detected() ? POWER_SOURCE_USB : POWER_SOURCE_BATTERY;
     if (new_source != s_source) {
@@ -162,35 +176,62 @@ bool power_manager_check(EventGroupHandle_t system_events)
                  s_source == POWER_SOURCE_USB ? "USB" : "battery", s_battery_mv);
     }
 #else
-    if (s_source == POWER_SOURCE_BATTERY && s_battery_mv > BATTERY_USB_HYSTERESIS) {
-        s_source = POWER_SOURCE_USB;
-        transition = true;
-        ESP_LOGI(TAG, "Power source: USB detected (%d mV)", s_battery_mv);
-    } else if (s_source == POWER_SOURCE_USB && s_battery_mv < BATTERY_USB_THRESHOLD) {
-        s_source = POWER_SOURCE_BATTERY;
-        transition = true;
-        ESP_LOGI(TAG, "Power source: battery (%d mV, %d%%)",
-                 s_battery_mv, voltage_to_percent(s_battery_mv));
+    if (do_battery_read) {
+        if (s_source == POWER_SOURCE_UNKNOWN) {
+            /* Resolve an indeterminate source the same way init does. The
+             * hysteresis rules below only transition between BATTERY and USB, so
+             * without this an ESP32 that booted into UNKNOWN would stay UNKNOWN
+             * forever (ESP-8). */
+            if (s_battery_mv > BATTERY_USB_THRESHOLD) {
+                s_source = POWER_SOURCE_USB;
+                transition = true;
+            } else if (s_battery_mv > BATTERY_NO_BATTERY_MIN && s_battery_mv < BATTERY_NO_BATTERY_MAX) {
+                s_source = POWER_SOURCE_BATTERY;
+                transition = true;
+            }
+            if (transition) {
+                ESP_LOGI(TAG, "Power source resolved: %s (%d mV)",
+                         s_source == POWER_SOURCE_USB ? "USB" : "battery", s_battery_mv);
+            }
+        } else if (s_source == POWER_SOURCE_BATTERY && s_battery_mv > BATTERY_USB_HYSTERESIS) {
+            s_source = POWER_SOURCE_USB;
+            transition = true;
+            ESP_LOGI(TAG, "Power source: USB detected (%d mV)", s_battery_mv);
+        } else if (s_source == POWER_SOURCE_USB && s_battery_mv < BATTERY_USB_THRESHOLD) {
+            s_source = POWER_SOURCE_BATTERY;
+            transition = true;
+            ESP_LOGI(TAG, "Power source: battery (%d mV, %d%%)",
+                     s_battery_mv, voltage_to_percent(s_battery_mv));
+        }
     }
 #endif
 
     /* CPU frequency and light sleep on power source transition.
-     * Battery: cap at 160MHz + enable light sleep (~1-3mA average).
-     * USB: full 240MHz + disable light sleep (native USB Serial/JTAG on
-     *      ESP32-S3 is powered down during light sleep, causing a bus reset
-     *      and chip reboot). No power saving needed on USB anyway. */
+     * Battery: cap at 160MHz + enable light sleep (~1-3mA average). */
     if (s_source != s_last_freq_source) {
         bool on_battery = (s_source == POWER_SOURCE_BATTERY);
+#if CONFIG_IDF_TARGET_ESP32S3
+        /* S3 native USB-Serial/JTAG is powered down during light sleep, causing a
+         * bus reset and chip reboot — so disable light sleep while on USB. */
+        bool light_sleep = on_battery;
+#else
+        /* ESP32 / LilyGo T5 uses an external UART bridge (CP210x) that survives
+         * light sleep, so keep light sleep enabled regardless of the detected
+         * source. Otherwise a fully-charged cell resting at ~4.15V is misread as
+         * USB and light sleep stays disabled (~40-60mA) for hours until the cell
+         * sags below the threshold — which the disabled sleep only hastens (ESP-8). */
+        bool light_sleep = true;
+#endif
         esp_pm_config_t pm_cfg = {
             .max_freq_mhz = on_battery ? 160 : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
             .min_freq_mhz = 80,
-            .light_sleep_enable = on_battery
+            .light_sleep_enable = light_sleep
         };
         esp_err_t pm_ret = esp_pm_configure(&pm_cfg);
         if (pm_ret == ESP_OK) {
             ESP_LOGI(TAG, "CPU freq cap set to %d MHz, light sleep %s (%s)",
                      pm_cfg.max_freq_mhz,
-                     on_battery ? "enabled" : "disabled",
+                     light_sleep ? "enabled" : "disabled",
                      on_battery ? "battery" : "USB");
         }
         s_last_freq_source = s_source;
@@ -223,73 +264,10 @@ bool power_manager_has_valid_battery_reading(void)
     return s_battery_sense_available;
 }
 
-/**
- * Handle physical button press with tiered hold duration actions.
- * Same tiered behavior as the Arduino version:
- *
- *   < 3 seconds:  Short press — show status (battery, connection)
- *   3-9 seconds:  Enter pairing mode for multi-platform linking
- *   15+ seconds:  Enter WiFi provisioning portal (factory reset WiFi)
- *
- * Returns a button_result_t indicating what action the caller should take.
- * The caller (button_task in app_main) handles display rendering and
- * system events, avoiding a circular dependency between power_manager
- * and display_manager.
- */
-button_result_t power_manager_handle_button(void)
-{
-    button_result_t result = {
-        .action = BUTTON_ACTION_NONE,
-        .battery_percent = power_manager_get_battery_percent(),
-        .battery_mv = s_battery_mv,
-        .source = s_source,
-        .has_auth_token = false,
-    };
-
-    board_pins_t pins;
-    board_get_pin_config(&pins);
-
-    int64_t press_start_us = esp_timer_get_time();
-
-    /* Measure hold duration (up to 17s max) by polling GPIO level.
-     * Button is active LOW — held = gpio reads 0. */
-    while (gpio_get_level((gpio_num_t)pins.button_gpio) == 0) {
-        int64_t held_ms = (esp_timer_get_time() - press_start_us) / 1000;
-        if (held_ms > 17000) {
-            break;  /* Safety limit */
-        }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-
-    int64_t press_duration_ms = (esp_timer_get_time() - press_start_us) / 1000;
-    ESP_LOGI(TAG, "Button held for %lld ms", press_duration_ms);
-
-    if (press_duration_ms >= 15000) {
-        /* 15+ seconds: WiFi provisioning portal (factory reset WiFi) */
-        ESP_LOGI(TAG, "Extra-long press — WiFi provisioning requested");
-        result.action = BUTTON_ACTION_WIFI_PORTAL;
-
-    } else if (press_duration_ms >= 3000) {
-        /* 3-9 seconds: Enter pairing mode for multi-platform linking */
-        const app_config_t *cfg = config_manager_get_config();
-        result.has_auth_token = (cfg->security.auth_token[0] != '\0');
-
-        if (result.has_auth_token) {
-            ESP_LOGI(TAG, "Medium press — pairing mode requested");
-            result.action = BUTTON_ACTION_ENTER_PAIRING;
-        } else {
-            ESP_LOGW(TAG, "Medium press but no auth token — cannot pair");
-            result.action = BUTTON_ACTION_SHOW_STATUS;
-        }
-
-    } else {
-        /* Short press: show status */
-        ESP_LOGI(TAG, "Short press — show status");
-        result.action = BUTTON_ACTION_SHOW_STATUS;
-    }
-
-    return result;
-}
+/* power_manager_handle_button() removed: button_task in app_main.cpp implements
+ * the hold-duration state machine inline (it needs to drive mid-hold display
+ * feedback and level-triggered GPIO re-arming), so this parallel copy was dead
+ * code that could only drift out of sync. */
 
 int power_manager_get_battery_mv(void)
 {

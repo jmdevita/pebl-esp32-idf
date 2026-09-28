@@ -201,8 +201,18 @@ void wifi_credential_manager_update_last_used(const char *ssid)
 {
     for (int i = 0; i < s_count; i++) {
         if (strcmp(s_credentials[i].ssid, ssid) == 0) {
-            s_credentials[i].last_used = (uint32_t)time(NULL);
-            save_to_nvs();
+            uint32_t now = (uint32_t)time(NULL);
+            uint32_t prev = s_credentials[i].last_used;
+            s_credentials[i].last_used = now;
+            /* last_used only drives LRU eviction ordering, which has one-day
+             * granularity in practice. Rewriting NVS on every successful connect
+             * does a full erase-all + rewrite of the credential blob (see
+             * save_to_nvs) — needless flash wear on a device that reconnects on
+             * every wake. Persist only when the timestamp moved by at least a day
+             * (also skip if the clock hasn't been set yet, i.e. prev/now near 0). */
+            if (now > prev && (now - prev) >= 86400) {
+                save_to_nvs();
+            }
             return;
         }
     }

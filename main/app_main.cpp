@@ -41,6 +41,7 @@
 
 #include "config_manager.h"
 #include "wifi_manager.h"
+#include "wifi_credential_manager.h"
 #include "websocket_manager.h"
 #include "display_manager.h"
 #include "security_manager.h"
@@ -95,6 +96,52 @@ RTC_DATA_ATTR static struct {
     bool was_critical_battery;    // Previously entered critical sleep — require recovery threshold to exit
 } s_rtc_state = {};
 
+/* Brownout-backoff counter (RTC-retained so it survives the reset it's tracking).
+ *
+ * On a low/aged battery (or any marginal supply), WiFi power-up pulls a current
+ * spike that sags the rail below the brownout threshold and hard-resets the chip
+ * mid-connect. That reset lands BEFORE wifi_manager's failure counter increments,
+ * so the normal WiFi-fallback safety never engages — the device tight-loops on
+ * cold boot (visible as the splash re-flashing until the cell finally dies).
+ * The custom PCB has no battery sense (power_manager_has_valid_battery_reading()
+ * is false there), so we can't see the low voltage coming; the only signal we get
+ * is the brownout reset reason after the fact. We use it to back off instead of
+ * immediately re-attempting WiFi.
+ *
+ * Best-effort: a deep enough sag can wipe RTC RAM, resetting this to 0. That still
+ * yields a 30s backoff — escalation is lost but the destructive loop is still
+ * broken, which is the point. */
+RTC_DATA_ATTR static uint32_t s_brownout_backoff_count;
+
+/* Whether the "LOW BATTERY / Charge, then toggle switch" explanation screen has
+ * been drawn for the CURRENT brownout episode. E-paper retains its image with zero
+ * power, so a device that dies of battery exhaustion otherwise leaves whatever it
+ * last drew — usually the boot splash — and looks "stuck" rather than dead (users
+ * flip switches and hold reset buttons on a device with an empty cell). Drawn once
+ * per episode at backoff rung >= 3 (see the brownout breaker), cleared wherever the
+ * brownout counter clears. Latched AFTER the render completes so a brownout
+ * mid-draw retries on the next rung. Best-effort like the counter: a deep sag can
+ * wipe RTC RAM — worst case the screen draws again (cosmetically redundant,
+ * energetically minor). A full power cut (switch toggle) zeroes RTC RAM, which is
+ * exactly the reset-to-normal the screen's instructions ask the user to perform. */
+RTC_DATA_ATTR static bool s_drew_dead_battery_screen;
+
+/* Escalating deep-sleep backoff after a WiFi connect fails on an UNATTENDED
+ * deep-sleep wake (stored credentials present, no brownout). RTC-retained so the
+ * escalation survives the sleep it's tracking. Prevents a transient router outage
+ * at wake time from parking the device in the captive portal (~80-100mA) until
+ * the cell dies — see the WiFi-failed branch in app_main (ESP-1). Cleared on any
+ * successful WiFi association. */
+RTC_DATA_ATTR static uint32_t s_wifi_fail_backoff_count;
+
+/* Escalating awake-pairing attempt counter (RTC-retained). An unlinked device on
+ * battery would otherwise cycle boot → WS connect → NOT_LINKED → ~10 min awake
+ * pairing → restart → repeat forever, because a per-boot local counter resets on
+ * every esp_restart(). Persisting it lets the inter-attempt deep sleep lengthen as
+ * attempts accumulate, so an abandoned unlinked device settles into long naps
+ * instead of burning the cell awake (ESP-6). Cleared on successful pairing. */
+RTC_DATA_ATTR static uint32_t s_pairing_attempt_count;
+
 /* FreeRTOS task handles */
 static TaskHandle_t ws_task_handle = NULL;
 static TaskHandle_t display_task_handle = NULL;
@@ -108,7 +155,7 @@ static SemaphoreHandle_t button_semaphore = NULL;
 
 /* Event group bits */
 #define EVT_WIFI_CONNECTED      BIT0
-#define EVT_WS_CONNECTED        BIT1
+/* BIT1 reserved (was EVT_WS_CONNECTED — never set or waited, removed as dead code) */
 #define EVT_PAIRING_COMPLETE    BIT2
 #define EVT_SHUTDOWN_REQUEST    BIT3
 #define EVT_PAIRING_REQUEST     BIT4   /* button_task → ws_task: enter pairing mode */
@@ -131,6 +178,8 @@ static SemaphoreHandle_t button_semaphore = NULL;
 
 /* Forward declaration — defined before app_main(), used by ws_task and power_task */
 static void graceful_shutdown(void);
+/* Forward declaration — defined below app_main's helpers, used by ws_task */
+static uint64_t pairing_backoff_us(uint32_t count);
 
 /**
  * Block until display_task has drained the queue and the in-flight render
@@ -144,8 +193,12 @@ static bool wait_for_display_idle(uint32_t timeout_ms)
 {
     if (!display_queue || !system_events) return true;
     const TickType_t poll = pdMS_TO_TICKS(100);
-    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
-    while (xTaskGetTickCount() < deadline) {
+    /* Compare by elapsed subtraction rather than an absolute deadline: unsigned
+     * tick subtraction stays correct across the ~49.7-day tick counter wrap,
+     * whereas `tick < deadline` breaks when the deadline wraps past 0. */
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t limit = pdMS_TO_TICKS(timeout_ms);
+    while ((xTaskGetTickCount() - start) < limit) {
         EventBits_t bits = xEventGroupGetBits(system_events);
         if ((bits & EVT_DISPLAY_IDLE) && uxQueueMessagesWaiting(display_queue) == 0) {
             return true;
@@ -338,9 +391,10 @@ static void ws_task(void *arg)
         /* One-shot, started only when optional firmware is deferred */
     }
 
-    /* Track DEVICE_NOT_LINKED attempts to prevent infinite pairing loop on battery.
-     * After MAX attempts, show help screen and deep sleep so user can intervene. */
-    uint8_t device_not_linked_count = 0;
+    /* DEVICE_NOT_LINKED attempts are tracked in RTC (s_pairing_attempt_count) so the
+     * count survives the esp_restart() that ends each pairing cycle — a per-boot
+     * local would reset every restart and never escalate (ESP-6). After MAX awake
+     * attempts we switch to escalating deep-sleep naps instead of staying awake. */
     const uint8_t MAX_DEVICE_NOT_LINKED_ATTEMPTS = 2;
 
     /* Track DEVICE_NOT_REGISTERED retries (3 attempts with 30s delays, then deep sleep) */
@@ -348,7 +402,7 @@ static void ws_task(void *arg)
     const uint8_t MAX_REGISTRATION_RETRIES = 3;
 
     /* Event-driven main loop: ws_task blocks until an event bit fires.
-     * Timer-driven events: health check (5s), heartbeat (15s), OTA (24h).
+     * Timer-driven events: health check (30s), heartbeat (30s), OTA (24h).
      * Callback-driven events: server errors, firmware updates (from WS handler).
      * Button-driven events: pairing, WiFi portal (from button_task ISR).
      *
@@ -379,10 +433,15 @@ static void ws_task(void *arg)
             ws_error_code_t ws_error = websocket_manager_get_pending_error(&error_info);
 
             if (ws_error == WS_ERROR_DEVICE_NOT_LINKED) {
-                device_not_linked_count++;
+                s_pairing_attempt_count++;
 
-                if (device_not_linked_count > MAX_DEVICE_NOT_LINKED_ATTEMPTS) {
-                    ESP_LOGW(TAG, "Too many DEVICE_NOT_LINKED errors — sleeping");
+                if (s_pairing_attempt_count > MAX_DEVICE_NOT_LINKED_ATTEMPTS) {
+                    /* Stop cycling boot→WS→~10min awake pairing→restart forever.
+                     * Deep-sleep with an escalating nap so an abandoned unlinked
+                     * device rests; the user can button-wake to pair anytime (ESP-6). */
+                    uint64_t nap_us = pairing_backoff_us(s_pairing_attempt_count);
+                    ESP_LOGW(TAG, "Device still not linked after %lu attempts — deep sleeping %llu min",
+                             (unsigned long)s_pairing_attempt_count, nap_us / 60000000ULL);
                     display_event_t evt = {};
                     evt.type = DISPLAY_EVT_STATUS;
                     snprintf(evt.data.status.line1, sizeof(evt.data.status.line1), "Pairing needed");
@@ -392,7 +451,7 @@ static void ws_task(void *arg)
                     vTaskDelay(pdMS_TO_TICKS(5000));
                     stop_ws_timers();
                     graceful_shutdown();
-                    power_manager_deep_sleep(15ULL * 60 * 1000000);  /* 15 minutes */
+                    power_manager_deep_sleep(nap_us);
                     break;
                 }
 
@@ -402,10 +461,28 @@ static void ws_task(void *arg)
                 websocket_manager_stop();
 
                 xEventGroupClearBits(system_events, EVT_PAIRING_COMPLETE);
-                pairing_manager_start(display_queue, system_events);
+                esp_err_t pair_ret = pairing_manager_start(display_queue, system_events);
+                if (pair_ret != ESP_OK) {
+                    /* Pairing request failed (server/DNS down) without setting
+                     * EVT_PAIRING_COMPLETE. Waiting on portMAX_DELAY here would hang
+                     * forever with WiFi associated (~80mA) — nap and retry instead,
+                     * matching the button-pairing path's return check (ESP-5). */
+                    uint64_t nap_us = pairing_backoff_us(s_pairing_attempt_count);
+                    ESP_LOGW(TAG, "Pairing request failed — deep sleeping %llu min before retry",
+                             nap_us / 60000000ULL);
+                    stop_ws_timers();
+                    graceful_shutdown();
+                    power_manager_deep_sleep(nap_us);
+                    break;
+                }
+
+                /* pairing_manager_start() returns ESP_OK only once the code is
+                 * claimed (it already set EVT_PAIRING_COMPLETE), so this wait
+                 * returns immediately. Pairing timeout/expiry restart internally. */
                 xEventGroupWaitBits(system_events, EVT_PAIRING_COMPLETE,
                                     pdFALSE, pdTRUE, portMAX_DELAY);
 
+                s_pairing_attempt_count = 0;
                 security_manager_reset_key_uploaded();
 
                 ESP_LOGI(TAG, "Pairing complete — restarting");
@@ -565,10 +642,27 @@ static void ws_task(void *arg)
             wifi_manager_disconnect();
 
             xEventGroupClearBits(system_events, EVT_WIFI_CONNECTED);
-            wifi_manager_start_portal(system_events, EVT_WIFI_CONNECTED);
-            xEventGroupWaitBits(system_events, EVT_WIFI_CONNECTED,
-                                pdFALSE, pdTRUE, portMAX_DELAY);
-            wifi_manager_stop_portal();
+            if (wifi_manager_start_portal(system_events, EVT_WIFI_CONNECTED) != ESP_OK) {
+                ESP_LOGE(TAG, "Portal failed to start — restarting");
+                vTaskDelay(pdMS_TO_TICKS(100));
+                esp_restart();
+                break;
+            }
+            /* Bounded wait: a portal left unattended must not beacon the SoftAP
+             * (~80-100mA) forever. 15 min is generous for a user actively
+             * provisioning; on timeout, restart back into normal operation
+             * (which retries stored networks) rather than drain the cell. */
+            {
+                EventBits_t pbits = xEventGroupWaitBits(system_events, EVT_WIFI_CONNECTED,
+                    pdFALSE, pdTRUE, pdMS_TO_TICKS(15 * 60 * 1000));
+                wifi_manager_stop_portal();
+                if (!(pbits & EVT_WIFI_CONNECTED)) {
+                    ESP_LOGW(TAG, "WiFi provisioning timed out — restarting");
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    esp_restart();
+                    break;
+                }
+            }
 
             ESP_LOGI(TAG, "WiFi provisioning complete — restarting");
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -576,7 +670,7 @@ static void ws_task(void *arg)
             break;
         }
 
-        /* --- Connection health check (5s timer) --- */
+        /* --- Connection health check (30s timer) --- */
         if (bits & EVT_HEALTH_CHECK) {
             resilience_action_t action = resilience_manager_check_health();
             switch (action) {
@@ -662,10 +756,12 @@ static void ws_task(void *arg)
 }
 
 /**
- * Download emoji PNG from a cached URL for display restore after reconnect.
- * Returns heap-allocated buffer (caller must free), or NULL on failure.
- * Kept simple — websocket_manager has a similar function for the normal path,
- * but exposing it would create an unnecessary cross-component dependency.
+ * Download an emoji PNG from a URL, run entirely in display_task context.
+ * Returns a heap-allocated buffer (caller/display_manager frees it), or NULL on
+ * failure. Used both for deep-sleep display restore AND for the normal reaction
+ * render path: the download was deliberately moved out of the WebSocket event
+ * handler (which would stall all WS RX and open a second TLS session) into
+ * display_task, which already does TLS work at its 8KB stack (ESP-M6).
  */
 static uint8_t *download_emoji_for_restore(const char *url, size_t *out_size)
 {
@@ -719,6 +815,15 @@ static uint8_t *download_emoji_for_restore(const char *url, size_t *out_size)
     esp_http_client_cleanup(client);
 
     if (total_read == 0) {
+        free(buf);
+        return NULL;
+    }
+
+    /* Reject a short read against a known Content-Length: a truncated PNG renders
+     * as garbage and wastes a display queue slot + heap. (content_length was set
+     * to the 64KB cap when the length was unknown, so skip the check in that case.) */
+    if (total_read < content_length && content_length != 64 * 1024) {
+        ESP_LOGW(TAG, "Emoji download incomplete: %d/%d bytes", total_read, content_length);
         free(buf);
         return NULL;
     }
@@ -782,10 +887,24 @@ static void display_task(void *arg)
     ESP_LOGI(TAG, "display_task started");
     display_event_t evt;
 
+    /* The "Connection Lost" (and boot) dot animation wakes this task every ~800ms
+     * for a ~300ms partial refresh, holding the CPU busy ~40% of the time and
+     * defeating light sleep for the whole disconnected period (up to 30 min). On
+     * battery, freeze the animation after this many cycles — the last frame stays
+     * on the e-paper (zero power) and tickless idle can take over. On USB there's
+     * no battery cost, so animate indefinitely (ESP-M2). */
+    const int MAX_BATTERY_DOT_CYCLES = 30;   /* ~24s of animation before settling */
+    int dot_anim_cycles = 0;
+
     while (!(xEventGroupGetBits(system_events) & EVT_SHUTDOWN_REQUEST)) {
         /* Shorter timeout during dot animation (boot/disconnected) for updates
-         * (~800ms per frame). Otherwise use the normal shutdown-check interval. */
-        TickType_t timeout = display_manager_is_dot_animating()
+         * (~800ms per frame). Otherwise use the normal shutdown-check interval.
+         * Once the animation is frozen on battery, revert to the long interval so
+         * the task stops waking. */
+        bool animating = display_manager_is_dot_animating();
+        bool on_battery = (power_manager_get_source() == POWER_SOURCE_BATTERY);
+        bool anim_paused = animating && on_battery && dot_anim_cycles >= MAX_BATTERY_DOT_CYCLES;
+        TickType_t timeout = (animating && !anim_paused)
             ? pdMS_TO_TICKS(800)
             : pdMS_TO_TICKS(TASK_SHUTDOWN_CHECK_MS);
 
@@ -796,6 +915,8 @@ static void display_task(void *arg)
 
         if (xQueueReceive(display_queue, &evt, timeout) == pdTRUE) {
             xEventGroupClearBits(system_events, EVT_DISPLAY_IDLE);
+            /* A real event ends the disconnected animation — reset the freeze counter. */
+            dot_anim_cycles = 0;
             /* Three-way logic for CONNECTED events to suppress redundant e-paper refreshes.
              * On light sleep reconnects (~5-10 min), the screen content hasn't changed,
              * so refreshing wastes 2-4s of battery and causes visible flicker.
@@ -842,6 +963,21 @@ static void display_task(void *arg)
                 }
             }
 
+            /* Fetch the emoji PNG here in display_task rather than in the WS
+             * event handler (ESP-M6). The WS handler only recorded emoji_url; a
+             * reaction restored from RTC already carries its image. Download only
+             * when a URL is present but no image has been fetched yet. */
+            if (evt.type == DISPLAY_EVT_REACTION &&
+                evt.data.reaction.emoji_png_data == NULL &&
+                evt.data.reaction.emoji_url[0] != '\0') {
+                size_t png_size = 0;
+                uint8_t *png_data = download_emoji_for_restore(evt.data.reaction.emoji_url, &png_size);
+                if (png_data) {
+                    evt.data.reaction.emoji_png_data = png_data;
+                    evt.data.reaction.emoji_png_size = png_size;
+                }
+            }
+
             display_manager_render(&evt);
 
             /* Persist display content to RTC memory for deep sleep recovery.
@@ -877,8 +1013,21 @@ static void display_task(void *arg)
                 s_rtc_state.showing_connection_lost = true;
             }
         } else if (display_manager_is_dot_animating()) {
-            /* Queue timed out — advance dot animation via partial refresh */
-            display_manager_animate_dots();
+            /* Queue timed out during the dot animation. */
+            if (on_battery && dot_anim_cycles >= MAX_BATTERY_DOT_CYCLES) {
+                /* Frozen on battery — skip the SPI refresh so the CPU can light
+                 * sleep; the last dot frame remains on the e-paper (ESP-M2). */
+            } else {
+                /* Advance the animation. Clear EVT_DISPLAY_IDLE around the partial
+                 * SPI refresh and restore it after: without this the queue-timeout
+                 * branch leaves the idle bit set, so a concurrent shutdown's
+                 * wait_for_display_idle() could pass and cut power mid-transfer
+                 * (ESP-M3). */
+                xEventGroupClearBits(system_events, EVT_DISPLAY_IDLE);
+                display_manager_animate_dots();
+                xEventGroupSetBits(system_events, EVT_DISPLAY_IDLE);
+                dot_anim_cycles++;
+            }
         }
     }
 
@@ -887,7 +1036,8 @@ static void display_task(void *arg)
 
 /**
  * Power task: monitors battery voltage, manages sleep transitions.
- * Runs on a 5-minute interval.
+ * Loops every 30s (source detection); the battery ADC burst inside
+ * power_manager_check() is internally rate-limited to every 5 minutes.
  *
  * Low battery (<30%): Top bar shows "LOW BATTERY" automatically via
  * draw_power_status_text() — no full-screen warning needed.
@@ -920,28 +1070,37 @@ static void power_task(void *arg)
          * power_manager_check() updates voltage/source but no longer sleeps
          * directly, so we can show the screen first. */
         if (power_manager_is_critical_battery()) {
-            ESP_LOGW(TAG, "Critical battery (%d mV) — showing warning before indefinite deep sleep",
+            ESP_LOGW(TAG, "Critical battery (%d mV) — graceful shutdown before indefinite deep sleep",
                      power_manager_get_battery_mv());
             s_rtc_state.was_critical_battery = true;
             display_event_t evt = {};
             evt.type = DISPLAY_EVT_LOW_BATTERY;
             xQueueSend(display_queue, &evt, pdMS_TO_TICKS(1000));
-            vTaskDelay(pdMS_TO_TICKS(5000));  /* Let display_task render before sleep */
+            /* Route through the same graceful path the trial-expired branch uses
+             * rather than deep-sleeping directly after a fixed 5s. Wait for the
+             * warning (and any in-flight render) to fully paint, then
+             * graceful_shutdown() drains the queue and hibernates the panel. A
+             * 4-gray refresh can run ~10s worst case, so a fixed delay could cut
+             * power mid-SPI — corrupting the frame and leaving the panel
+             * un-hibernated (higher standby draw) while parked (ESP-3). */
+            if (!wait_for_display_idle(30000)) {
+                ESP_LOGW(TAG, "Display did not go idle within 30s — sleeping anyway");
+            }
+            stop_ws_timers();
+            graceful_shutdown();
             power_manager_deep_sleep(0);  /* Indefinite — button wake only, prevents drain to death */
             /* Does not return */
         }
 
-        /* Block for 5 minutes or until shutdown requested.
-         * Battery voltage changes slowly (~1mV/min under light load), so
-         * checking every 5 minutes is sufficient for USB/battery detection
-         * and critical battery shutdown. The cell's own protection circuit
-         * is the real safety net against over-discharge.
-         *
-         * Previous 10-second interval caused unnecessary wakes: 16 ADC
-         * samples × 5ms delay each = 80ms of active time, 8,640 times/day.
-         * At 5-minute intervals this drops to 288 times/day. */
+        /* Block for 30 seconds or until shutdown requested.
+         * The expensive 16-sample battery ADC burst is rate-limited to every
+         * 5 minutes inside power_manager_check() (voltage drifts slowly), but the
+         * loop itself runs every 30s so a USB unplug/replug is detected within
+         * ~30s instead of up to 5 minutes — otherwise light sleep stays disabled
+         * for minutes after unplug on the ESP32-S3 (ESP-M7). The per-loop source
+         * check is cheap (SOF counter, ~3ms on S3); the ADC burst is not repeated. */
         xEventGroupWaitBits(system_events, EVT_SHUTDOWN_REQUEST,
-            pdFALSE, pdFALSE, pdMS_TO_TICKS(300000));
+            pdFALSE, pdFALSE, pdMS_TO_TICKS(30000));
     }
 
     vTaskDelete(NULL);
@@ -951,9 +1110,10 @@ static void power_task(void *arg)
  * Button task: handles physical button presses via GPIO ISR.
  * Blocks on semaphore with finite timeout — allows checking shutdown flag.
  *
- * power_manager_handle_button() returns an action (not void) to avoid
- * a circular dependency between power_manager and display_manager.
- * This task translates button actions into display events and system actions.
+ * The hold-duration state machine is implemented inline here (rather than in
+ * power_manager) because it drives mid-hold display feedback and must re-arm the
+ * level-triggered GPIO after release. It translates hold durations into system
+ * events: 3-9s → pairing request, 15s+ → WiFi provisioning request.
  */
 static void button_task(void *arg)
 {
@@ -1095,21 +1255,34 @@ static esp_err_t init_nvs(void)
  */
 static void enable_light_sleep(void)
 {
+#if CONFIG_IDF_TARGET_ESP32S3
+    /* S3 native USB-Serial/JTAG is powered down in light sleep → bus reset →
+     * reboot. Disable light sleep only while on USB (no power saving needed there). */
     bool on_usb = (power_manager_get_source() == POWER_SOURCE_USB);
+    bool light_sleep = !on_usb;
+#else
+    /* ESP32 / LilyGo T5 uses an external UART bridge (CP210x) that survives light
+     * sleep, so keep it enabled regardless of source. Voltage-based source
+     * detection can misread a full cell (~4.15V) as USB, which would otherwise
+     * disable light sleep for hours (~40-60mA) until the cell sags (ESP-8). */
+    bool on_usb = false;
+    bool light_sleep = true;
+#endif
 
     esp_pm_config_t pm_config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz = 80,
-        .light_sleep_enable = !on_usb
+        .light_sleep_enable = light_sleep
     };
     ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
 
-    if (on_usb) {
-        ESP_LOGI(TAG, "USB connected — light sleep disabled (WiFi power save still active)");
-    } else {
+    if (light_sleep) {
         ESP_LOGI(TAG, "Auto light sleep enabled with WiFi DTIM power save");
+    } else {
+        ESP_LOGI(TAG, "USB connected — light sleep disabled (WiFi power save still active)");
     }
+    (void)on_usb;
 }
 
 /**
@@ -1253,10 +1426,56 @@ static void run_boot_diagnostics(void)
     ESP_LOGI(TAG, "Diagnostics dismissed — continuing normal boot");
 }
 
+/* Escalating deep-sleep backoff after a brownout reset, in microseconds.
+ * Each successive brownout lengthens the rest period: a healthy cell charging on
+ * USB recovers after the first 30s nap, while a failed/absent cell parks at
+ * 10-minute cycles — minimal self-discharge — instead of a tight reboot loop.
+ * Indexed by the (1-based) brownout count, clamped to the last rung. */
+static uint64_t brownout_backoff_us(uint32_t count)
+{
+    static const uint64_t ladder_s[] = { 30, 60, 120, 300, 600 };
+    const size_t n = sizeof(ladder_s) / sizeof(ladder_s[0]);
+    uint32_t idx = (count == 0) ? 0 : (count - 1);
+    if (idx >= n) idx = n - 1;
+    return ladder_s[idx] * 1000000ULL;
+}
+
+/* Escalating deep-sleep nap between pairing attempts for an unlinked device, in
+ * microseconds, indexed by the (1-based) attempt count and clamped to the last
+ * rung. Short at first (the user is likely nearby just after setup), lengthening
+ * to 30-minute naps so an abandoned, never-linked device rests instead of burning
+ * the cell in back-to-back ~10-minute awake pairing cycles (ESP-6). */
+static uint64_t pairing_backoff_us(uint32_t count)
+{
+    static const uint64_t ladder_min[] = { 5, 15, 30 };
+    const size_t n = sizeof(ladder_min) / sizeof(ladder_min[0]);
+    uint32_t idx = (count == 0) ? 0 : (count - 1);
+    if (idx >= n) idx = n - 1;
+    return ladder_min[idx] * 60ULL * 1000000ULL;
+}
+
+/* Escalating deep-sleep nap after a WiFi connect fails on an UNATTENDED wake of an
+ * already-provisioned device, in microseconds, indexed by the (1-based) failure
+ * count and clamped to the last rung. A transient router/AP outage recovers within
+ * a minute or two; a longer outage settles into 30-minute naps. Never opens the
+ * captive portal on these wakes — the SoftAP beacons at ~80-100mA and would drain
+ * the cell to death while nobody is watching (ESP-1). */
+static uint64_t wifi_fail_backoff_us(uint32_t count)
+{
+    static const uint64_t ladder_min[] = { 1, 5, 15, 30 };
+    const size_t n = sizeof(ladder_min) / sizeof(ladder_min[0]);
+    uint32_t idx = (count == 0) ? 0 : (count - 1);
+    if (idx >= n) idx = n - 1;
+    return ladder_min[idx] * 60ULL * 1000000ULL;
+}
+
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "=== Slack Reactions E-Paper Display (ESP-IDF) ===");
-    ESP_LOGI(TAG, "Boot reason: %d", esp_sleep_get_wakeup_cause());
+    ESP_LOGI(TAG, "Boot reason: wake_cause=%d reset_reason=%d "
+                  "(esp_reset_reason_t: %d=POWERON %d=SW %d=DEEPSLEEP %d=BROWNOUT)",
+             esp_sleep_get_wakeup_cause(), esp_reset_reason(),
+             ESP_RST_POWERON, ESP_RST_SW, ESP_RST_DEEPSLEEP, ESP_RST_BROWNOUT);
 
     /* 1. Initialize NVS and event loop */
     ESP_ERROR_CHECK(init_nvs());
@@ -1274,7 +1493,12 @@ extern "C" void app_main(void)
 #if CONFIG_IDF_TARGET_ESP32S3 && CONFIG_DISPLAY_GDEY0213B74
     {
         app_config_t *mut_cfg = config_manager_get_mutable_config();
-        if (strncmp(mut_cfg->device.display_variant, "custom_pcb_", 11) != 0) {
+        /* Skip the self-heal flash write when this boot followed a brownout: the
+         * rail is known to be sagging, and a LittleFS write on a marginal supply
+         * risks corrupting config. The correction is idempotent and retries on the
+         * next healthy boot (ESP-B2). */
+        if (esp_reset_reason() != ESP_RST_BROWNOUT &&
+            strncmp(mut_cfg->device.display_variant, "custom_pcb_", 11) != 0) {
             ESP_LOGW(TAG,
                      "Self-heal: rewriting display_variant '%s' -> 'custom_pcb_gdey_4g'",
                      mut_cfg->device.display_variant);
@@ -1324,6 +1548,76 @@ extern "C" void app_main(void)
     bool is_deep_sleep_wake = (wake_reason == ESP_SLEEP_WAKEUP_TIMER ||
                                wake_reason == ESP_SLEEP_WAKEUP_EXT0 ||
                                wake_reason == ESP_SLEEP_WAKEUP_EXT1);
+
+    /* 4a. Brownout-backoff circuit breaker.
+     * If the last reset was a brownout, the rail sagged — on this hardware that's
+     * almost always WiFi power-up on a low/failing battery (see s_brownout_backoff_count).
+     * Charging straight back into wifi_manager_connect() just sags and resets again.
+     * Instead, deep-sleep with escalating backoff so the cell can relax or charge.
+     * Runs after board_init (step 3) so wake sources are configured; runs BEFORE
+     * the normal display init so we don't spend an e-paper full-refresh (itself a
+     * current spike) on the very boot we're trying to survive — the panel retains
+     * its last image with zero power. Exception: at rung >= 3 we deliberately spend
+     * ONE refresh on a last-gasp explanation screen (below). A manual power-cycle
+     * clears the backoff. */
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    if (reset_reason == ESP_RST_BROWNOUT) {
+        s_brownout_backoff_count++;
+        uint64_t backoff_us = brownout_backoff_us(s_brownout_backoff_count);
+        ESP_LOGW(TAG, "Brownout reset (#%lu) — backing off %llu s before retrying WiFi "
+                      "(low/failing battery or marginal supply)",
+                 (unsigned long)s_brownout_backoff_count, backoff_us / 1000000ULL);
+
+        /* Last-gasp explanation screen. Three consecutive brownouts through the
+         * escalating ladder is a genuine power problem, not a transient — rungs 1-2
+         * also occur on healthy cells recovering on charge or in cold weather, and
+         * drawing there would flash a scary warning at devices that recover 30s
+         * later. Draw "LOW BATTERY / Charge, then toggle switch" once, so the
+         * retained e-paper image explains WHY the device is dark instead of showing
+         * a stale splash that makes a dead device look merely stuck. Current
+         * budget: a mono refresh peaks ~20-40mA vs the ~300mA WiFi spike that keeps
+         * causing these brownouts, and we draw before any WiFi init — survivable
+         * even on a sagging cell. If the refresh itself browns out, the flag is
+         * still unset (latched only after render returns) and the next rung
+         * retries. display_manager_init(true) skips the splash render, so the only
+         * pixels spent are our own screen. This path matters most on hardware
+         * without battery sense (custom PCB v1.1), where the <15% critical-battery
+         * screen never triggers and brownout is the first observable symptom. */
+        if (s_brownout_backoff_count >= 3 && !s_drew_dead_battery_screen) {
+            if (display_manager_init(true /* preserve = no splash */) == ESP_OK) {
+                display_event_t bat_evt = {};
+                bat_evt.type = DISPLAY_EVT_LOW_BATTERY;
+                display_manager_render(&bat_evt);
+                s_drew_dead_battery_screen = true;
+                /* The warning replaced whatever content was on screen. Mark it so
+                 * the DISPLAY_EVT_CONNECTED handler restores the last reaction (or
+                 * shows the connected screen) once the device recovers, instead of
+                 * leaving a healthy device parked on "LOW BATTERY". */
+                s_rtc_state.showing_connection_lost = true;
+                ESP_LOGW(TAG, "Dead-battery explanation screen drawn (brownout rung %lu)",
+                         (unsigned long)s_brownout_backoff_count);
+            }
+        }
+
+        /* Does not return — wakes on the timer (retry) or the button (user). */
+        power_manager_deep_sleep(backoff_us);
+    } else if (reset_reason == ESP_RST_POWERON || reset_reason == ESP_RST_EXT) {
+        /* Unambiguous fresh/external reset (battery inserted, EN pin) — the user
+         * intervened, so start the ladder over.
+         *
+         * Deliberately NOT clearing on ESP_RST_SW: on the ESP32-S3 a brownout can
+         * be MISREPORTED as a software reset (esp-idf issue #17718 — the raw reset
+         * code is 0x3 and RTC context is lost when the sag is deep). Treating SW as
+         * "manual reset" here would wrongly clear the backoff mid-loop and defeat
+         * the breaker. A genuine SW reset (e.g. OTA reboot) is harmless to leave the
+         * counter on — it's cleared on the next successful WiFi connect (step 12). */
+        s_brownout_backoff_count = 0;
+        s_drew_dead_battery_screen = false;
+    }
+    /* Any other reason (ESP_RST_SW, ESP_RST_WDT — both possible brownout aliases on
+     * S3 — plus ESP_RST_DEEPSLEEP from our own backoff wake and OTA reboots) leaves
+     * the counter untouched so escalation persists across the recovery cycle and
+     * resets only on a confirmed success (step 12) or unambiguous power-on. */
 
     /* 5. Initialize display (show splash on cold boot, preserve on wake) */
     bool skip_display_refresh = false;
@@ -1387,6 +1681,11 @@ extern "C" void app_main(void)
                 display_manager_render(&bat_evt);
                 vTaskDelay(pdMS_TO_TICKS(5000));  // Let e-paper finish refresh
                 s_rtc_state.was_critical_battery = true;
+                /* The warning replaced the on-screen content. Mark it so the
+                 * DISPLAY_EVT_CONNECTED handler restores the last reaction (or shows
+                 * the connected screen) after the battery recovers, instead of
+                 * leaving a recharged device parked on "LOW BATTERY". */
+                s_rtc_state.showing_connection_lost = true;
             }
             // Already showing low battery screen from prior cycle — skip redundant refresh
             power_manager_deep_sleep(0);      // Indefinite — button wake only
@@ -1436,6 +1735,27 @@ extern "C" void app_main(void)
     } else if (wifi_manager_connect() == ESP_OK) {
         xEventGroupSetBits(system_events, EVT_WIFI_CONNECTED);
     } else {
+        /* WiFi connection failed. Deciding whether to open the captive portal:
+         * the portal beacons a SoftAP at ~80-100mA with no way to light-sleep, so
+         * opening it on an UNATTENDED deep-sleep wake of an already-provisioned
+         * device would let a transient router/AP outage drain the cell to death
+         * (ESP-1). Only open it when a human is plausibly present — a cold boot
+         * (someone just powered/plugged in) or a device with no stored credentials
+         * (nothing to retry). Otherwise nap with escalating backoff and retry. */
+        uint8_t cred_count = 0;
+        (void)wifi_credential_manager_get_all(&cred_count);
+        bool have_credentials = (cred_count > 0);
+
+        if (is_deep_sleep_wake && have_credentials) {
+            if (s_wifi_fail_backoff_count < UINT32_MAX) s_wifi_fail_backoff_count++;
+            uint64_t nap_us = wifi_fail_backoff_us(s_wifi_fail_backoff_count);
+            ESP_LOGW(TAG,
+                     "WiFi unreachable on unattended wake (attempt %lu) — napping %llu min "
+                     "instead of draining the cell in the captive portal",
+                     (unsigned long)s_wifi_fail_backoff_count, nap_us / 60000000ULL);
+            power_manager_deep_sleep(nap_us);  /* does not return */
+        }
+
         ESP_LOGW(TAG, "WiFi connection failed, starting captive portal");
 
         /* Show WiFi provisioning screen with QR code and instructions */
@@ -1447,16 +1767,38 @@ extern "C" void app_main(void)
                 sizeof(portal_evt.data.wifi_provision.ip) - 1);
         xQueueSend(display_queue, &portal_evt, pdMS_TO_TICKS(1000));
 
-        wifi_manager_start_portal(system_events, EVT_WIFI_CONNECTED);
-        /* Portal runs until credentials are provided and WiFi connects.
-         * Portal save handler sets EVT_WIFI_CONNECTED on system_events. */
-        xEventGroupWaitBits(system_events, EVT_WIFI_CONNECTED,
-                            pdFALSE, pdTRUE, portMAX_DELAY);
+        if (wifi_manager_start_portal(system_events, EVT_WIFI_CONNECTED) != ESP_OK) {
+            ESP_LOGE(TAG, "Captive portal failed to start — napping 15 min before retry");
+            power_manager_deep_sleep(15ULL * 60 * 1000000);  /* does not return */
+        }
 
-        /* Shut down the captive portal (HTTP server, DNS, SoftAP) now that
-         * WiFi is connected. Frees ~15KB RAM and stops DNS hijacking. */
+        /* Portal runs until credentials are provided and WiFi connects, but not
+         * forever: even during an attended cold boot the SoftAP drains the battery,
+         * so cap the wait. If nobody provisions within the window, nap and re-show
+         * the portal on the next wake (a never-provisioned device still lands here
+         * because have_credentials stays false). */
+        #define PORTAL_PROVISION_TIMEOUT_MS (30UL * 60 * 1000)
+        EventBits_t portal_bits = xEventGroupWaitBits(
+            system_events, EVT_WIFI_CONNECTED,
+            pdFALSE, pdTRUE, pdMS_TO_TICKS(PORTAL_PROVISION_TIMEOUT_MS));
+
+        /* Shut down the captive portal (HTTP server, DNS, SoftAP) — either we
+         * connected, or we timed out. Frees ~15KB RAM and stops DNS hijacking. */
         wifi_manager_stop_portal();
+
+        if (!(portal_bits & EVT_WIFI_CONNECTED)) {
+            ESP_LOGW(TAG, "Captive portal timed out with no connection — napping 15 min");
+            power_manager_deep_sleep(15ULL * 60 * 1000000);  /* does not return */
+        }
     }
+
+    /* Survived to here with WiFi up (direct connect or via the portal). Clear both
+     * the brownout ladder and the WiFi-fail ladder so a future failure starts fresh
+     * at the shortest rung (ESP-B1 — previously cleared only on the direct branch).
+     * Also re-arm the dead-battery explanation screen for the next episode. */
+    s_brownout_backoff_count = 0;
+    s_wifi_fail_backoff_count = 0;
+    s_drew_dead_battery_screen = false;
 
     /* 12b. Sync timezone (sets system clock for quiet hours).
      * Must happen after WiFi connects. On cold boot, always syncs.
@@ -1481,9 +1823,24 @@ extern "C" void app_main(void)
     const app_config_t *cfg = config_manager_get_config();
     if (cfg->security.auth_token[0] == '\0') {
         ESP_LOGI(TAG, "No auth token — starting self-service pairing");
-        pairing_manager_start(display_queue, system_events);
+        esp_err_t pair_ret = pairing_manager_start(display_queue, system_events);
+        if (pair_ret != ESP_OK) {
+            /* Pairing request failed (server/DNS down) without setting
+             * EVT_PAIRING_COMPLETE. Waiting on portMAX_DELAY here would hang the
+             * boot forever with WiFi associated (~80mA) — and unlike the
+             * DEVICE_NOT_LINKED path, power_task/ws_task aren't started yet, so
+             * nothing would ever escalate it. Nap with escalating backoff and
+             * retry on the next boot instead (ESP-5). */
+            if (s_pairing_attempt_count < UINT32_MAX) s_pairing_attempt_count++;
+            uint64_t nap_us = pairing_backoff_us(s_pairing_attempt_count);
+            ESP_LOGW(TAG, "Pairing request failed at boot — deep sleeping %llu min before retry",
+                     nap_us / 60000000ULL);
+            graceful_shutdown();
+            power_manager_deep_sleep(nap_us);  /* does not return */
+        }
         xEventGroupWaitBits(system_events, EVT_PAIRING_COMPLETE,
                             pdFALSE, pdTRUE, portMAX_DELAY);
+        s_pairing_attempt_count = 0;
 
         /* New pairing creates a fresh user record on the server without a key.
          * Reset the upload flag so we re-upload even if NVS had uploaded=yes
@@ -1525,7 +1882,11 @@ extern "C" void app_main(void)
     enable_light_sleep();
 
     /* 17. Start remaining tasks — ws_task and power_task need WiFi connected */
-    xTaskCreate(ws_task,      "ws_task",      6144, NULL, 5, &ws_task_handle);
+    /* ws_task runs inline TLS work — captive-portal-free pairing (esp_http_client)
+     * and OTA (esp_https_ota) — whose mbedTLS handshake temporaries alone peak at
+     * 4-6KB of caller stack. 6144 overflowed on deep cert chains; 12288 leaves
+     * headroom (ESP-7). */
+    xTaskCreate(ws_task,      "ws_task",      12288, NULL, 5, &ws_task_handle);
     xTaskCreate(power_task,   "power_task",   4096, NULL, 6, &power_task_handle);
 
     ESP_LOGI(TAG, "All tasks started — entering event-driven mode");

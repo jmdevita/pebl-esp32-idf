@@ -44,7 +44,6 @@ static const char *TAG = "WS";
 #define HEARTBEAT_INTERVAL_MS   30000
 #define HEARTBEAT_TIMEOUT_MS    90000
 #define WS_INITIAL_RECONNECT_MS 15000
-#define WS_MAX_RECONNECT_MS     60000
 /* esp_websocket_client ping interval. Set high (120s) rather than matching
  * server's 20s because: (1) setting 0 falls back to 10s default (worse),
  * (2) pingpong_timeout_sec defaults to 0 (no dead-connection detection),
@@ -89,9 +88,6 @@ static size_t s_rx_buffer_capacity = 0;
  * client may store the pointer rather than copying the string */
 static char s_uri[768];
 
-/* Maximum emoji PNG size to download (prevent OOM on malicious URLs) */
-#define MAX_EMOJI_PNG_SIZE  (64 * 1024)
-
 /**
  * Copy a JSON string field to a fixed-size destination buffer.
  * Truncates if source exceeds dest_size-1.
@@ -105,83 +101,6 @@ static void copy_json_string(char *dest, size_t dest_size, const cJSON *obj, con
     } else {
         dest[0] = '\0';
     }
-}
-
-/**
- * Download emoji PNG from URL via HTTP GET.
- * Returns heap-allocated buffer with PNG data, or NULL on failure.
- * Caller must free the returned buffer.
- */
-static uint8_t *download_emoji_png(const char *url, size_t *out_size)
-{
-    if (!url || url[0] == '\0') {
-        return NULL;
-    }
-
-    esp_http_client_config_t http_cfg = {
-        .url = url,
-        .timeout_ms = 10000,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
-    if (!client) {
-        return NULL;
-    }
-
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        esp_http_client_cleanup(client);
-        return NULL;
-    }
-
-    int content_length = esp_http_client_fetch_headers(client);
-    if (content_length <= 0 || content_length > MAX_EMOJI_PNG_SIZE) {
-        /* If content_length is unknown (-1), try reading up to max */
-        if (content_length < 0) {
-            content_length = MAX_EMOJI_PNG_SIZE;
-        } else {
-            ESP_LOGW(TAG, "Emoji too large: %d bytes", content_length);
-            esp_http_client_close(client);
-            esp_http_client_cleanup(client);
-            return NULL;
-        }
-    }
-
-    uint8_t *buf = (uint8_t *)malloc(content_length);
-    if (!buf) {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        return NULL;
-    }
-
-    int total_read = 0;
-    while (total_read < content_length) {
-        int read = esp_http_client_read(client, (char *)buf + total_read,
-                                         content_length - total_read);
-        if (read <= 0) {
-            break;
-        }
-        total_read += read;
-    }
-
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-
-    if (total_read == 0) {
-        free(buf);
-        return NULL;
-    }
-
-    /* Partial reads produce corrupt PNGs that waste display queue slots
-     * and heap memory. Free and return NULL so caller skips the emoji. */
-    if (total_read < content_length && content_length != MAX_EMOJI_PNG_SIZE) {
-        ESP_LOGW(TAG, "Emoji download incomplete: %d/%d bytes", total_read, content_length);
-        free(buf);
-        return NULL;
-    }
-
-    *out_size = total_read;
-    return buf;
 }
 
 /**
@@ -252,20 +171,19 @@ static void handle_reaction_message(const cJSON *source, bool was_encrypted)
              evt.data.reaction.user, evt.data.reaction.channel,
              evt.data.reaction.is_encrypted ? " [encrypted]" : "");
 
-    /* Cache emoji URL in event for RTC persistence (enables re-download on restore).
-     * Download the PNG immediately for the current render. */
+    /* Record the emoji URL only — the actual PNG download is deferred to
+     * display_task (ESP-M6). Downloading here would run a blocking HTTPS GET
+     * (up to 10s) inside the WS client's internal event-handler task, stalling
+     * ALL WebSocket RX — including server heartbeats, which then trip the
+     * heartbeat-timeout logic — and would open a second concurrent TLS session
+     * (~40KB heap spike, fragmentation risk on the 520KB-RAM ESP32). display_task
+     * fetches the PNG from this URL before rendering (it already does so for the
+     * deep-sleep restore path). emoji_png_data stays NULL here. */
     const cJSON *emoji_url = cJSON_GetObjectItemCaseSensitive(source, "emoji_url");
     if (cJSON_IsString(emoji_url) && emoji_url->valuestring[0] != '\0') {
         strncpy(evt.data.reaction.emoji_url, emoji_url->valuestring,
                 sizeof(evt.data.reaction.emoji_url) - 1);
         evt.data.reaction.emoji_url[sizeof(evt.data.reaction.emoji_url) - 1] = '\0';
-
-        size_t png_size = 0;
-        uint8_t *png_data = download_emoji_png(emoji_url->valuestring, &png_size);
-        if (png_data) {
-            evt.data.reaction.emoji_png_data = png_data;
-            evt.data.reaction.emoji_png_size = png_size;
-        }
     }
 
     /* Push to display queue (non-blocking: if queue full, drop oldest) */
@@ -696,8 +614,27 @@ void websocket_manager_process(EventGroupHandle_t system_events)
     if (connected && last_hb > 0) {
         int64_t elapsed_ms = (esp_timer_get_time() - last_hb) / 1000;
         if (elapsed_ms > HEARTBEAT_TIMEOUT_MS) {
-            ESP_LOGW(TAG, "Heartbeat timeout (%lld ms) — connection may be dead", elapsed_ms);
+            ESP_LOGW(TAG, "Heartbeat timeout (%lld ms) — bouncing WS client", elapsed_ms);
             resilience_manager_mark_connection_lost();
+            /* Directly stop+restart the WS client instead of only marking the
+             * connection lost. The TCP connection is dead, but esp_websocket_client
+             * won't notice until its own ping/keepalive fails — meanwhile s_connected
+             * stays true and nothing reconnects, so the only recovery was the
+             * resilience escalation to a full WiFi cycle ~5 min later (ESP-M1). A
+             * local WS restart is a cheap reconnect for what is usually just a
+             * dropped TCP session. Runs in ws_task context; esp_websocket_client_stop
+             * is synchronous and safe here. */
+            if (s_client) {
+                esp_websocket_client_stop(s_client);
+                atomic_store(&s_connected, false);
+                atomic_store(&s_registered, false);
+                esp_err_t rr = esp_websocket_client_start(s_client);
+                if (rr != ESP_OK) {
+                    ESP_LOGW(TAG, "WS restart after heartbeat timeout failed: %s",
+                             esp_err_to_name(rr));
+                }
+            }
+            return;  /* Reconnecting — skip the heartbeat send this cycle */
         }
     }
 
@@ -705,7 +642,11 @@ void websocket_manager_process(EventGroupHandle_t system_events)
     if (connected && atomic_load(&s_registered)) {
         static int64_t s_last_sent_heartbeat_us = 0;
         int64_t now = esp_timer_get_time();
-        if (now - s_last_sent_heartbeat_us > (int64_t)HEARTBEAT_INTERVAL_MS * 1000) {
+        /* Trigger a few seconds before the nominal interval so the 30s heartbeat
+         * timer (which can fire a hair early after a light-sleep wake) reliably
+         * sends every cycle rather than occasionally skipping one and leaving a
+         * ~60s gap in the server's 90s window (strict '>' vs exactly-30s). */
+        if (now - s_last_sent_heartbeat_us > (int64_t)(HEARTBEAT_INTERVAL_MS - 5000) * 1000) {
             char hb[128];
             int len = snprintf(hb, sizeof(hb),
                                "{\"type\":\"heartbeat\",\"timestamp\":%lld}",

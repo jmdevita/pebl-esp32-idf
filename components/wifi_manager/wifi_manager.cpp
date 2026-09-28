@@ -60,6 +60,18 @@ static int s_retry_count = 0;
 static bool s_connected = false;
 static esp_netif_t *s_sta_netif = NULL;
 
+/* One-time driver bring-up guard. wifi_manager_connect() is not re-entrant:
+ * the netif, event group and event handlers may only be created/registered
+ * once. It is legitimately called twice in one boot (boot diagnostics connect,
+ * then the normal step-12 connect), and start_portal() may also need the
+ * driver up — so the STA init is factored into ensure_wifi_initialized() and
+ * gated by this flag to avoid leaking the event group, asserting on a duplicate
+ * netif (IDF v5), or double-registering handlers (ESP-M4). */
+static bool s_wifi_initialized = false;
+/* SoftAP netif — created once and reused across portal sessions. Creating it on
+ * every wifi_manager_start_portal() call leaks a netif on a second session (ESP-2). */
+static esp_netif_t *s_ap_netif = NULL;
+
 /**
  * Generate a 4-character hash from a string using polynomial rolling hash.
  * Multiplier 31, mod 1679616 (36^4), result as zero-padded base-36.
@@ -141,6 +153,11 @@ static void set_hostname(void)
 }
 static httpd_handle_t s_portal_server = NULL;
 static TaskHandle_t s_dns_task_handle = NULL;
+/* Cooperative shutdown flag for the DNS task. stop_portal() sets it and waits
+ * for the task to close its own socket and self-delete, rather than vTaskDelete()
+ * while the task is blocked in recvfrom() — which leaks the UDP socket every
+ * portal cycle. */
+static volatile bool s_dns_task_stop = false;
 
 /* Cached WiFi scan results — populated by portal_do_scan(), served by portal_root_handler().
  * Avoids blocking the root page load with a 3-5 second scan. */
@@ -233,8 +250,17 @@ static esp_err_t try_connect_once(void)
 
     wifi_config_t wifi_cfg = {};
     strncpy((char *)wifi_cfg.sta.ssid, creds[best_cred_idx].ssid, sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, creds[best_cred_idx].password, sizeof(wifi_cfg.sta.password) - 1);
-    wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    /* Copy up to the full field width (64) rather than field-1: a 64-character
+     * hex WPA2 PSK legitimately fills all 64 bytes with no NUL terminator, and
+     * strncpy(..., sizeof-1) would silently truncate it (ESP-M5). The struct is
+     * zero-initialized above, so shorter ASCII passphrases stay NUL-terminated. */
+    strncpy((char *)wifi_cfg.sta.password, creds[best_cred_idx].password, sizeof(wifi_cfg.sta.password));
+    /* Open networks carry an empty password. Pinning the scan threshold to
+     * WPA2_PSK makes the driver reject a saved open AP on every boot after the
+     * first (it connected once before the threshold was consulted), so derive
+     * the authmode from whether a password is present (ESP-M5). */
+    wifi_cfg.sta.threshold.authmode = creds[best_cred_idx].password[0] != '\0'
+        ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
 
@@ -348,27 +374,22 @@ static esp_err_t connect_to_best_network(void)
     return ESP_FAIL;
 }
 
-esp_err_t wifi_manager_connect(void)
+/**
+ * One-time bring-up of the STA netif, WiFi driver, event group and handlers.
+ * Idempotent: safe to call from both wifi_manager_connect() (possibly twice per
+ * boot) and wifi_manager_start_portal(). Leaves the driver started in STA mode.
+ * Returns ESP_OK once the driver is up.
+ */
+static esp_err_t ensure_wifi_initialized(void)
 {
-    /* Check fallback mode: skip WiFi entirely after repeated failures.
-     * After 6 wakes in fallback (~6 hours at 60-min deep sleep interval),
-     * reset all state and try WiFi again from LOW power. */
-    if (s_wifi_power_state.fallback_mode) {
-        s_wifi_power_state.fallback_wake_count++;
-        if (s_wifi_power_state.fallback_wake_count >= 6) {
-            ESP_LOGI(TAG, "Fallback recovery — resetting WiFi power state");
-            s_wifi_power_state.fallback_mode = false;
-            s_wifi_power_state.current_power = TX_POWER_LOW;
-            s_wifi_power_state.total_failed_wakes = 0;
-            s_wifi_power_state.fallback_wake_count = 0;
-        } else {
-            ESP_LOGW(TAG, "WiFi fallback mode — skipping WiFi (wake %d/6)",
-                     s_wifi_power_state.fallback_wake_count);
-            return ESP_FAIL;
-        }
+    if (s_wifi_initialized) {
+        return ESP_OK;
     }
 
     s_wifi_events = xEventGroupCreate();
+    if (!s_wifi_events) {
+        return ESP_ERR_NO_MEM;
+    }
 
     /* Initialize TCP/IP and WiFi */
     ESP_ERROR_CHECK(esp_netif_init());
@@ -390,6 +411,36 @@ esp_err_t wifi_manager_connect(void)
     /* Initialize credential manager (loads NVS + merges seed networks) */
     wifi_credential_manager_init();
 
+    s_wifi_initialized = true;
+    return ESP_OK;
+}
+
+esp_err_t wifi_manager_connect(void)
+{
+    /* Check fallback mode: skip WiFi entirely after repeated failures.
+     * After 6 wakes in fallback (~6 hours at 60-min deep sleep interval),
+     * reset all state and try WiFi again from LOW power.
+     * Checked before driver init so a fallback wake stays cheap. */
+    if (s_wifi_power_state.fallback_mode) {
+        s_wifi_power_state.fallback_wake_count++;
+        if (s_wifi_power_state.fallback_wake_count >= 6) {
+            ESP_LOGI(TAG, "Fallback recovery — resetting WiFi power state");
+            s_wifi_power_state.fallback_mode = false;
+            s_wifi_power_state.current_power = TX_POWER_LOW;
+            s_wifi_power_state.total_failed_wakes = 0;
+            s_wifi_power_state.fallback_wake_count = 0;
+        } else {
+            ESP_LOGW(TAG, "WiFi fallback mode — skipping WiFi (wake %d/6)",
+                     s_wifi_power_state.fallback_wake_count);
+            return ESP_FAIL;
+        }
+    }
+
+    esp_err_t init_ret = ensure_wifi_initialized();
+    if (init_ret != ESP_OK) {
+        return init_ret;
+    }
+
     /* Skip the entire scan/connect cycle if there are no credentials — returning
      * ESP_FAIL here triggers the captive portal immediately. Without this check,
      * connect_to_best_network() would run 9 scans across 3 TX power levels (~40s)
@@ -402,6 +453,17 @@ esp_err_t wifi_manager_connect(void)
     }
 
     return connect_to_best_network();
+}
+
+bool wifi_manager_has_credentials(void)
+{
+    /* Loads seed networks + NVS credentials on first call (idempotent). Used by
+     * app_main to decide whether a failed connect should open the captive portal
+     * or just deep-sleep and retry (ESP-1). */
+    wifi_credential_manager_init();
+    uint8_t count = 0;
+    wifi_credential_manager_get_all(&count);
+    return count > 0;
 }
 
 /* System event group and bit — set by wifi_manager_start_portal().
@@ -622,7 +684,9 @@ static esp_err_t portal_save_handler(httpd_req_t *req)
     /* Attempt to connect with the new credentials */
     wifi_config_t wifi_cfg = {};
     strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, password, sizeof(wifi_cfg.sta.password) - 1);
+    /* Full field width (64) so a 64-char hex PSK isn't truncated (ESP-M5);
+     * struct is zero-initialized so shorter passphrases stay NUL-terminated. */
+    strncpy((char *)wifi_cfg.sta.password, password, sizeof(wifi_cfg.sta.password));
     wifi_cfg.sta.threshold.authmode = strlen(password) > 0 ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
 
     esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
@@ -752,12 +816,12 @@ static void dns_server_task(void *arg)
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     uint8_t buf[512];
-    while (true) {
+    while (!s_dns_task_stop) {
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
         int len = recvfrom(sock, buf, sizeof(buf), 0,
                            (struct sockaddr *)&client_addr, &addr_len);
-        if (len < 12) continue;  /* Too short or timeout */
+        if (len < 12) continue;  /* Too short or timeout — loop re-checks stop flag */
 
         /* Build DNS response:
          * - Copy query header, set QR=1 (response), ANCOUNT=1
@@ -793,19 +857,36 @@ static void dns_server_task(void *arg)
                (struct sockaddr *)&client_addr, addr_len);
     }
 
+    /* Close our own socket on the way out (stop flag set by stop_portal) so the
+     * UDP socket isn't leaked across portal cycles. */
     close(sock);
+    s_dns_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
-void wifi_manager_start_portal(EventGroupHandle_t system_events, EventBits_t wifi_connected_bit)
+esp_err_t wifi_manager_start_portal(EventGroupHandle_t system_events, EventBits_t wifi_connected_bit)
 {
     ESP_LOGI(TAG, "Starting captive portal (AP: pebl-setup)");
 
     s_system_events = system_events;
     s_wifi_connected_bit = wifi_connected_bit;
 
-    /* Switch to AP+STA mode for captive portal */
-    esp_netif_create_default_wifi_ap();
+    /* The driver must be initialized before we touch set_mode/set_config, or the
+     * calls abort() on an uninitialized driver — reachable on the WiFi-fallback
+     * path where wifi_manager_connect() returned before ever calling esp_wifi_init()
+     * (ESP-2b). ensure_wifi_initialized() is idempotent and leaves the driver
+     * started in STA mode. */
+    esp_err_t init_ret = ensure_wifi_initialized();
+    if (init_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Cannot start portal — WiFi init failed: %s", esp_err_to_name(init_ret));
+        return init_ret;
+    }
+
+    /* Create the SoftAP netif exactly once. Doing it every portal start leaks a
+     * netif (and duplicates the AP) on a second in-boot session (ESP-2). */
+    if (!s_ap_netif) {
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+    }
 
     wifi_config_t ap_cfg = {};
     memcpy(ap_cfg.ap.ssid, "pebl-setup", 10);
@@ -813,8 +894,23 @@ void wifi_manager_start_portal(EventGroupHandle_t system_events, EventBits_t wif
     ap_cfg.ap.channel = 1;
     ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
     ap_cfg.ap.max_connection = 2;
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    esp_err_t mode_ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (mode_ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_mode(APSTA) failed: %s", esp_err_to_name(mode_ret));
+        return mode_ret;
+    }
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+
+    /* Start the driver so the AP actually beacons. The button-provisioning path
+     * runs wifi_manager_disconnect() first (esp_wifi_stop()), so without this the
+     * AP never comes up and ws_task blocks forever (ESP-2). On the cold-boot path
+     * the driver is already started from the failed connect, so tolerate
+     * ESP_ERR_WIFI_NOT_STOPPED ("already started"). */
+    esp_err_t start_ret = esp_wifi_start();
+    if (start_ret != ESP_OK && start_ret != ESP_ERR_WIFI_NOT_STOPPED) {
+        ESP_LOGE(TAG, "esp_wifi_start() for portal failed: %s", esp_err_to_name(start_ret));
+        return start_ret;
+    }
 
     /* Start HTTP server for captive portal */
     httpd_config_t httpd_cfg = HTTPD_DEFAULT_CONFIG();
@@ -880,7 +976,9 @@ void wifi_manager_start_portal(EventGroupHandle_t system_events, EventBits_t wif
 
     /* Start DNS server — resolves all domains to 192.168.4.1 so that
      * OS captive portal detection requests reach our HTTP server. */
+    s_dns_task_stop = false;
     xTaskCreate(dns_server_task, "dns_task", 4096, NULL, 3, &s_dns_task_handle);
+    return ESP_OK;
 }
 
 void wifi_manager_stop_portal(void)
@@ -892,12 +990,21 @@ void wifi_manager_stop_portal(void)
     }
 
     if (s_dns_task_handle) {
-        vTaskDelete(s_dns_task_handle);
+        /* Signal the DNS task to break out of recvfrom() and close its own
+         * socket, then wait for it to self-delete. The recv timeout is 2s, so
+         * allow generous headroom. This avoids vTaskDelete()-ing a task blocked
+         * in recvfrom(), which would leak the bound UDP socket each cycle. */
+        s_dns_task_stop = true;
+        for (int i = 0; i < 40 && s_dns_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
         s_dns_task_handle = NULL;
         ESP_LOGI(TAG, "DNS server stopped");
     }
 
-    /* Switch from AP+STA back to STA-only to free the SoftAP resources */
+    /* Switch from AP+STA back to STA-only to free the SoftAP resources.
+     * The AP netif (s_ap_netif) is intentionally kept for reuse on a later
+     * portal session. */
     esp_wifi_set_mode(WIFI_MODE_STA);
     ESP_LOGI(TAG, "Captive portal shut down, switched to STA mode");
 }

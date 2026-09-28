@@ -19,14 +19,27 @@ extern "C" {
 esp_err_t wifi_manager_connect(void);
 
 /**
+ * Returns true if any WiFi credentials are stored (config seed networks or NVS).
+ * Loads the credential store on first call (idempotent). Callers use this to
+ * decide whether a failed connect should open the captive portal (attended,
+ * provisioning needed) or simply deep-sleep and retry later.
+ */
+bool wifi_manager_has_credentials(void);
+
+/**
  * Start captive portal for WiFi provisioning.
- * Creates SoftAP "pebl-setup" with branded HTML portal.
- * Portal runs until user submits credentials and WiFi connects.
+ * Creates SoftAP "pebl-setup" with branded HTML portal and starts the WiFi
+ * driver so the AP beacons. Portal runs until user submits credentials and
+ * WiFi connects.
  *
  * system_events: event group from app_main (sets wifi_connected_bit on success)
  * wifi_connected_bit: the bit to set in system_events when WiFi connects
+ *
+ * Returns ESP_OK if the portal started (AP beaconing, HTTP+DNS up), or an error
+ * if the WiFi driver could not be brought up. Callers must not block waiting for
+ * a connection if this returns non-OK.
  */
-void wifi_manager_start_portal(EventGroupHandle_t system_events, EventBits_t wifi_connected_bit);
+esp_err_t wifi_manager_start_portal(EventGroupHandle_t system_events, EventBits_t wifi_connected_bit);
 
 /**
  * Stop the captive portal (HTTP server, DNS server, SoftAP).

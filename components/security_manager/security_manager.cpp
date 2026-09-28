@@ -374,15 +374,32 @@ char *security_manager_decrypt(const char *envelope_json)
             goto cleanup;
         }
 
+        /* Reject an ephemeral key that isn't on our expected P-256 curve. Our
+         * private scalar is P-256; running ECDH against a point on a different
+         * curve is meaningless and would otherwise surface as a confusing GCM
+         * auth failure rather than a clear "wrong curve" error. */
+        if (grp.id != MBEDTLS_ECP_DP_SECP256R1) {
+            ESP_LOGE(TAG, "Ephemeral key not on SECP256R1 (curve id=%d)", (int)grp.id);
+            mbedtls_ecp_group_free(&grp);
+            mbedtls_ecp_point_free(&ephQ);
+            mbedtls_mpi_free(&d);
+            mbedtls_mpi_free(&shared_z);
+            goto cleanup;
+        }
+
         /* Load our private key scalar and compute shared secret */
         mbedtls_mpi_read_binary(&d, s_private_key, 32);
 
         ret = mbedtls_ecdh_compute_shared(&grp, &shared_z, &ephQ, &d,
                                            mbedtls_ctr_drbg_random, &s_ctr_drbg);
 
+        /* Serialize the shared X-coordinate to a fixed 32-byte big-endian buffer.
+         * Capture the write return: mbedtls_mpi_write_binary fails if the value
+         * somehow needs more than 32 bytes, which must not be treated as a valid
+         * secret. */
         uint8_t shared_secret[32];
         if (ret == 0) {
-            mbedtls_mpi_write_binary(&shared_z, shared_secret, 32);
+            ret = mbedtls_mpi_write_binary(&shared_z, shared_secret, 32);
         }
 
         mbedtls_mpi_free(&d);
@@ -395,26 +412,45 @@ char *security_manager_decrypt(const char *envelope_json)
             goto cleanup;
         }
 
-        /* 3. Base64-decode salt, IV, tag, ciphertext */
+        /* 3. Base64-decode salt, IV, tag, ciphertext.
+         * Every decode return is checked: a truncated/invalid field would
+         * otherwise leave a short buffer and surface downstream as a misleading
+         * GCM auth failure (or use the wrong salt in HKDF), instead of a clear
+         * "bad field" error. IV and tag also have exact expected lengths. */
         uint8_t salt[32];
         size_t salt_len = 0;
         if (cJSON_IsString(salt_b64)) {
-            mbedtls_base64_decode(salt, sizeof(salt), &salt_len,
-                                   (const uint8_t *)salt_b64->valuestring,
-                                   strlen(salt_b64->valuestring));
+            ret = mbedtls_base64_decode(salt, sizeof(salt), &salt_len,
+                                        (const uint8_t *)salt_b64->valuestring,
+                                        strlen(salt_b64->valuestring));
+            if (ret != 0) {
+                ESP_LOGE(TAG, "salt base64 decode failed: -0x%04x", -ret);
+                memset(shared_secret, 0, sizeof(shared_secret));
+                goto cleanup;
+            }
         }
 
         uint8_t iv[12];
         size_t iv_len = 0;
-        mbedtls_base64_decode(iv, sizeof(iv), &iv_len,
-                               (const uint8_t *)iv_b64->valuestring,
-                               strlen(iv_b64->valuestring));
+        ret = mbedtls_base64_decode(iv, sizeof(iv), &iv_len,
+                                    (const uint8_t *)iv_b64->valuestring,
+                                    strlen(iv_b64->valuestring));
+        if (ret != 0 || iv_len != 12) {
+            ESP_LOGE(TAG, "Invalid GCM IV (decode=-0x%04x, len=%zu, expected 12)", -ret, iv_len);
+            memset(shared_secret, 0, sizeof(shared_secret));
+            goto cleanup;
+        }
 
         uint8_t tag[16];
         size_t tag_len = 0;
-        mbedtls_base64_decode(tag, sizeof(tag), &tag_len,
-                               (const uint8_t *)tag_b64->valuestring,
-                               strlen(tag_b64->valuestring));
+        ret = mbedtls_base64_decode(tag, sizeof(tag), &tag_len,
+                                    (const uint8_t *)tag_b64->valuestring,
+                                    strlen(tag_b64->valuestring));
+        if (ret != 0 || tag_len != 16) {
+            ESP_LOGE(TAG, "Invalid GCM tag (decode=-0x%04x, len=%zu, expected 16)", -ret, tag_len);
+            memset(shared_secret, 0, sizeof(shared_secret));
+            goto cleanup;
+        }
 
         /* Ciphertext can be large — heap allocate */
         size_t ct_b64_len = strlen(encrypted_b64->valuestring);
@@ -425,9 +461,15 @@ char *security_manager_decrypt(const char *envelope_json)
             goto cleanup;
         }
         size_t ct_len = 0;
-        mbedtls_base64_decode(ciphertext, ct_max_len, &ct_len,
-                               (const uint8_t *)encrypted_b64->valuestring,
-                               ct_b64_len);
+        ret = mbedtls_base64_decode(ciphertext, ct_max_len, &ct_len,
+                                    (const uint8_t *)encrypted_b64->valuestring,
+                                    ct_b64_len);
+        if (ret != 0) {
+            ESP_LOGE(TAG, "ciphertext base64 decode failed: -0x%04x", -ret);
+            memset(shared_secret, 0, sizeof(shared_secret));
+            free(ciphertext);
+            goto cleanup;
+        }
 
         /* 4. HKDF-SHA256: derive AES key from shared secret + salt */
         uint8_t aes_key[32];

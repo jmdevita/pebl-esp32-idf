@@ -11,7 +11,7 @@
  * - Thread-safe: all state accessed only from ws_task (single writer)
  *
  * Escalation ladder:
- *   1. esp_websocket_client auto-reconnect (built-in, 15-60s backoff)
+ *   1. esp_websocket_client auto-reconnect (built-in, fixed 15s reconnect_timeout_ms)
  *   2. After 10 failed reconnects → WIFI_RECONNECT (caller forces WiFi cycle, ~7-10 min)
  *   3. After 5 WiFi reconnects   → RESILIENCE_ACTION_REBOOT (caller enters 60-min deep sleep)
  *   4. After 30min downtime      → DEEP_SLEEP (caller enters 60-min deep sleep)
@@ -85,7 +85,8 @@ resilience_action_t resilience_manager_check_health(void)
 {
     int64_t now = esp_timer_get_time();
 
-    /* Rate limit: only check every 5 seconds to avoid busy-loop overhead */
+    /* Rate limit: only check every 30 seconds (HEALTH_CHECK_INTERVAL_US) to
+     * avoid busy-loop overhead — matches the 30s health-check timer cadence. */
     if (now - s_state.last_check_us < HEALTH_CHECK_INTERVAL_US) {
         return RESILIENCE_ACTION_NONE;
     }

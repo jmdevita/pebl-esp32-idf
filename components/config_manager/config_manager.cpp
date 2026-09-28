@@ -143,16 +143,14 @@ static esp_err_t load_from_json(const char *json_str)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* Device section */
+    /* Device section.
+     * The empty-ID check is deliberately NOT done here — it runs
+     * unconditionally after all sections are parsed (see below) so that a
+     * config.json lacking a "device" object at all still gets a valid ID. */
     const cJSON *device = cJSON_GetObjectItemCaseSensitive(root, "device");
     if (cJSON_IsObject(device)) {
         const char *id = json_get_string(device, "id", "");
         safe_strcpy(s_config.device.id, sizeof(s_config.device.id), id);
-
-        if (s_config.device.id[0] == '\0' ||
-            strcmp(s_config.device.id, "esp32-default") == 0) {
-            auto_generate_device_id();
-        }
 
         safe_strcpy(s_config.device.name, sizeof(s_config.device.name),
                      json_get_string(device, "name", s_config.device.name));
@@ -250,6 +248,12 @@ static esp_err_t load_from_json(const char *json_str)
     if (cJSON_IsObject(power)) {
         s_config.power.sleep_enabled = json_get_bool(power, "sleep_enabled", s_config.power.sleep_enabled);
         s_config.power.sleep_duration_min = json_get_int(power, "sleep_duration_min", s_config.power.sleep_duration_min);
+        /* These fields are parsed for Arduino config.json compatibility but are
+         * NOT yet enforced by the IDF firmware — sleep timing is governed by
+         * power_manager's own light-sleep/DTIM logic, which ignores them. Warn
+         * so a user who sets them isn't misled into expecting a behavior change. */
+        ESP_LOGW(TAG, "power.sleep_enabled/sleep_duration_min are parsed but NOT "
+                      "enforced by the IDF firmware (managed by power_manager)");
     }
 
     /* Logging section */
@@ -277,6 +281,11 @@ static esp_err_t load_from_json(const char *json_str)
         s_config.quiet_hours.start_hour = json_get_int(qh, "start_hour", s_config.quiet_hours.start_hour);
         s_config.quiet_hours.end_hour = json_get_int(qh, "end_hour", s_config.quiet_hours.end_hour);
         s_config.quiet_hours.sleep_multiplier = json_get_int(qh, "sleep_multiplier", s_config.quiet_hours.sleep_multiplier);
+        /* Parsed for Arduino config.json compatibility, but quiet-hours sleep
+         * behavior is NOT yet implemented in the IDF firmware — no consumer
+         * reads these fields. Warn so the setting isn't silently ignored. */
+        ESP_LOGW(TAG, "quiet_hours is configured but NOT yet enforced by the IDF "
+                      "firmware — quiet-hours behavior is not implemented");
     }
 
     /* Display policy section */
@@ -292,6 +301,16 @@ static esp_err_t load_from_json(const char *json_str)
     }
 
     cJSON_Delete(root);
+
+    /* Ensure a device ID always exists, even when config.json omits the
+     * "device" section entirely (or leaves id empty / at the placeholder).
+     * This runs unconditionally after section parsing — an empty device.id
+     * would otherwise flow into the pairing/OTA/WebSocket URLs and produce
+     * malformed requests. */
+    if (s_config.device.id[0] == '\0' ||
+        strcmp(s_config.device.id, "esp32-default") == 0) {
+        auto_generate_device_id();
+    }
 
     /* Validation */
     if (s_config.device.display_variant[0] == '\0') {
@@ -367,16 +386,27 @@ esp_err_t config_manager_init(void)
     fseek(f, 0, SEEK_SET);
 
     if (file_size <= 0 || (size_t)file_size > MAX_CONFIG_SIZE) {
-        ESP_LOGE(TAG, "Config file invalid size: %ld (max %zu)", file_size, MAX_CONFIG_SIZE);
+        /* Fall back to defaults rather than returning a fatal error: the caller
+         * wraps init in ESP_ERROR_CHECK, so a fatal return would abort → boot
+         * loop. A user who hand-edits config.json past 4 KB (or truncates it)
+         * must not brick the device — same graceful path as a parse failure. */
+        ESP_LOGW(TAG, "Config file invalid size: %ld (max %zu) — using defaults",
+                 file_size, MAX_CONFIG_SIZE);
         fclose(f);
-        return ESP_ERR_INVALID_SIZE;
+        auto_generate_device_id();
+        s_loaded = true;
+        return ESP_OK;
     }
 
     char *buf = (char *)malloc(file_size + 1);
     if (buf == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate %ld bytes for config", file_size);
+        /* Fall back to defaults instead of a fatal ESP_ERR_NO_MEM return (which
+         * ESP_ERROR_CHECK in the caller would turn into an abort/boot loop). */
+        ESP_LOGW(TAG, "Failed to allocate %ld bytes for config — using defaults", file_size);
         fclose(f);
-        return ESP_ERR_NO_MEM;
+        auto_generate_device_id();
+        s_loaded = true;
+        return ESP_OK;
     }
 
     size_t read_bytes = fread(buf, 1, file_size, f);
@@ -413,19 +443,47 @@ esp_err_t config_manager_save(void)
         return ESP_ERR_NO_MEM;
     }
 
-    FILE *f = fopen(CONFIG_PATH, "w");
+    size_t json_len = strlen(json);
+
+    /* Atomic write: write to a temp file, then rename() over the live config.
+     * fopen(CONFIG_PATH, "w") truncates in place, so a power loss mid-write
+     * (pairing saves the auth token while on battery) would leave a corrupt,
+     * half-written config.json → next boot falls back to defaults → auth_token
+     * is lost → silent unpair. rename() is atomic on LittleFS, so an
+     * interrupted save leaves either the old file fully intact or the new file
+     * fully written — never a truncated hybrid. */
+    const char *tmp_path = "/littlefs/config.json.tmp";
+
+    FILE *f = fopen(tmp_path, "w");
     if (f == NULL) {
-        ESP_LOGE(TAG, "Failed to open config file for writing");
+        ESP_LOGE(TAG, "Failed to open temp config file for writing");
         free(json);
         return ESP_FAIL;
     }
 
-    size_t written = fwrite(json, 1, strlen(json), f);
-    fclose(f);
+    size_t written = fwrite(json, 1, json_len, f);
+    /* Capture the close result too: a buffered filesystem may only surface a
+     * write error (e.g. no free space) at fclose() time. */
+    int close_ret = fclose(f);
     free(json);
 
+    /* Require the full payload to land. A short write means the FS is full or
+     * failing — abort WITHOUT clobbering the existing good config. */
+    if (written != json_len || close_ret != 0) {
+        ESP_LOGE(TAG, "Config short write (%zu/%zu bytes, close=%d) — keeping previous config",
+                 written, json_len, close_ret);
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
+
+    if (rename(tmp_path, CONFIG_PATH) != 0) {
+        ESP_LOGE(TAG, "Failed to rename temp config into place — keeping previous config");
+        remove(tmp_path);
+        return ESP_FAIL;
+    }
+
     ESP_LOGI(TAG, "Configuration saved (%zu bytes)", written);
-    return (written > 0) ? ESP_OK : ESP_FAIL;
+    return ESP_OK;
 }
 
 void config_manager_reset(void)
