@@ -73,6 +73,13 @@ static EventGroupHandle_t s_system_events = NULL;
 static EventBits_t s_error_bit = 0;
 static EventBits_t s_firmware_bit = 0;
 
+/* Extra HTTP headers for the WebSocket upgrade request. Rebuilt from the
+ * current config on every websocket_manager_start(), which runs again after
+ * pairing, so the header always carries the token the device holds now.
+ * Static because esp_websocket_client keeps the pointer for the client's
+ * lifetime (it re-sends the headers on every internal reconnect). */
+static char s_ws_headers[sizeof("Authorization: Bearer \r\n") + CONFIG_MAX_STRING_LEN];
+
 /* Display queue handle — set by websocket_manager_start(), used by event handler
  * to push reaction events directly (FreeRTOS queues are thread-safe) */
 static QueueHandle_t s_display_queue = NULL;
@@ -587,6 +594,17 @@ esp_err_t websocket_manager_start(QueueHandle_t display_queue)
 
     if (cfg->server.use_ssl) {
         ws_cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    }
+
+    /* Authenticate on the upgrade request itself. The server verifies the
+     * header before touching any per-device state, and once it has seen a
+     * device use it, requires it (first-frame-only auth is then rejected).
+     * The register frame still carries auth_token too, so this firmware also
+     * works against a server that predates header auth. */
+    if (cfg->security.auth_token[0] != '\0') {
+        snprintf(s_ws_headers, sizeof(s_ws_headers), "Authorization: Bearer %s\r\n",
+                 cfg->security.auth_token);
+        ws_cfg.headers = s_ws_headers;
     }
 
     s_client = esp_websocket_client_init(&ws_cfg);

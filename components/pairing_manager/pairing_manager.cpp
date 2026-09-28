@@ -32,9 +32,11 @@ static bool s_active = false;
 /**
  * Perform HTTP request and read response body into heap-allocated buffer.
  * Caller must free() the returned buffer. Returns NULL on failure.
+ * auth_token: sent as X-Auth-Token when non-NULL and non-empty.
  */
 static char *http_request(const char *url, esp_http_client_method_t method,
-                           const char *post_data, int *out_status)
+                           const char *post_data, const char *auth_token,
+                           int *out_status)
 {
     esp_http_client_config_t http_cfg = {
         .url = url,
@@ -44,6 +46,10 @@ static char *http_request(const char *url, esp_http_client_method_t method,
     esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
     if (client == NULL) {
         return NULL;
+    }
+
+    if (auth_token && auth_token[0] != '\0') {
+        esp_http_client_set_header(client, "X-Auth-Token", auth_token);
     }
 
     if (post_data) {
@@ -128,7 +134,14 @@ esp_err_t pairing_manager_start(QueueHandle_t display_queue,
              cfg->server.host, cfg->device.id);
 
     int status = 0;
-    char *response = http_request(url, HTTP_METHOD_POST, NULL, &status);
+    /* A device that already holds a token (e.g. button-pairing to add another
+     * platform) proves possession with it. The server requires this for owned
+     * devices that have used header auth, so an outsider who knows the device_id
+     * can't start a pairing that would rotate this device's token. Devices
+     * without a token (first boot, or after the owner unlinked and the token
+     * was cleared) send none and pair as an unowned device. */
+    char *response = http_request(url, HTTP_METHOD_POST, NULL,
+                                  cfg->security.auth_token, &status);
     if (response == NULL || (status != 200 && status != 201)) {
         ESP_LOGE(TAG, "Pairing request failed (status %d)", status);
         free(response);
@@ -196,7 +209,7 @@ esp_err_t pairing_manager_start(QueueHandle_t display_queue,
         }
 
         status = 0;
-        response = http_request(url, HTTP_METHOD_GET, NULL, &status);
+        response = http_request(url, HTTP_METHOD_GET, NULL, NULL, &status);
         if (response == NULL || status != 200) {
             free(response);
             continue;
